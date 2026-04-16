@@ -1,64 +1,36 @@
-# 🗺️ Générateur d'Isochrones — Zones de Desserte
+# 🗺️ Isochrones — Zones de Desserte Sanitaire
 
-Application **Streamlit** multi-moteurs pour calculer des zones de desserte (isochrones)
-autour de structures sanitaires, sans ArcPy.
+Application Streamlit de génération d'isochrones autour des structures de santé.
 
-## 🔌 Moteurs de routing supportés
+## 5 Moteurs supportés
 
-| Moteur | Clé API ? | Précision | Remarques |
-|--------|-----------|-----------|----------|
-| **OSM local** (OSMnx + NetworkX) | ❌ Non | ⭐⭐⭐⭐ | 100% local, utilise vos routes OSM |
-| **OpenRouteService (ORS)** | ✅ Gratuite | ⭐⭐⭐⭐⭐ | 500 req/jour, 3 modes |
-| **OSRM Public** | ❌ Non | ⭐⭐⭐ | Approx. par matrice de durées |
-| **Valhalla Public** | ❌ Non | ⭐⭐⭐⭐ | Polygones natifs, 4 modes |
+| Moteur | Type | Clé requise | Remarque |
+|---|---|---|---|
+| **OSM local** (OSMnx + NetworkX) | Local | Non | Lit `Tps_min`, `Vit_kmh`, `maxspeed`, `osm_id` |
+| **OpenRouteService (ORS)** | API | Oui (gratuit) | 500 req/jour — [signup](https://openrouteservice.org/dev/#/signup) |
+| **OSRM Public** | API publique | Non | Approximatif, sans clé |
+| **Valhalla Public** | API publique | Non | Polygones précis, 4 modes |
+| **GraphHopper** | API publique | Non (opt.) | 500 req/jour sans clé |
 
-## 🚀 Installation
+## Fonctionnalités
+
+- Chargement fichier structures sanitaires (GeoJSON / Shapefile)
+- Chargement couche routes OSM avec colonnes **Tps_min / Vit_kmh / maxspeed / osm_id**
+- Mode **comparaison** : superpose les résultats de plusieurs moteurs en couleurs différentes
+- Export **GeoJSON** et **Shapefile (.zip)**
+- 3 algorithmes de forme : Alpha Shape, Convex Hull, Buffer sur nœuds
+
+## Déploiement Streamlit Cloud
+
+```toml
+# .streamlit/secrets.toml
+ORS_API_KEY = "votre_clé_ors"
+GH_API_KEY  = "votre_clé_graphhopper"  # optionnel
+```
+
+## Lancement local
 
 ```bash
 pip install -r requirements.txt
 streamlit run app/main.py
-```
-
-## 🔑 Clé ORS — Streamlit Secrets
-
-Créez `.streamlit/secrets.toml` :
-
-```toml
-ORS_API_KEY = "votre_clé_ors_ici"
-```
-
-Ou sur **Streamlit Cloud** → Settings → Secrets.
-
-## 📦 Colonnes OSM utilisées (mode OSM local)
-
-| Colonne | Description |
-|---------|-------------|
-| `Tps_min` | Temps de parcours en minutes |
-| `Vit_kmh` | Vitesse en km/h |
-| `maxspeed` | Vitesse maximale OSM |
-| `osm_id` | Identifiant OSM |
-
-## 📥 Entrées supportées
-
-- **GeoJSON / Shapefile** : couche de structures sanitaires (points)
-- **Saisie manuelle** : `nom, longitude, latitude`
-- **Exemple intégré** : 3 structures à Ouagadougou (Burkina Faso)
-
-## 📤 Sorties
-
-- 🗺️ Carte interactive Folium avec couches par intervalle de temps
-- 📊 Tableau récapitulatif (superficie en km²)
-- ⬇️ Export **GeoJSON** des isochrones calculés
-
-## 🏗️ Structure du projet
-
-```
-sante-isochrones-app/
-├── app/
-│   ├── main.py          # Application Streamlit principale
-│   └── utils.py         # Fonctions de calcul d'isochrones
-├── .streamlit/
-│   └── config.toml      # Configuration Streamlit
-├── requirements.txt
-└── README.md
 ```
