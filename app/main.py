@@ -17,6 +17,9 @@ from utils import compute_isochrone, engines_metadata
 import warnings
 warnings.filterwarnings("ignore")
 
+# Forcer pyogrio comme moteur GDAL (évite l'erreur fiona not installed)
+gpd.options.io_engine = "pyogrio"
+
 st.set_page_config(
     page_title="Isochrones — Zones de Desserte",
     page_icon="🗺️",
@@ -90,7 +93,7 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
     Stratégie :
       1. Écrire le contenu dans un fichier temporaire sur disque avec
          la bonne extension (pyogrio détecte alors le format via l'extension).
-      2. Lire avec gpd.read_file() depuis le chemin disque.
+      2. Lire avec gpd.read_file(engine="pyogrio") depuis le chemin disque.
       3. Nettoyer le fichier temporaire.
     """
     filename = uploaded_file.name
@@ -111,24 +114,24 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
         tmp_path = tmp.name
 
     try:
-        # Tentative 1 : lecture par chemin disque (pyogrio détecte via ext)
+        # Tentative 1 : lecture par chemin disque avec pyogrio explicite
         try:
-            gdf = gpd.read_file(tmp_path)
+            gdf = gpd.read_file(tmp_path, engine="pyogrio")
             return gdf
         except Exception:
             pass
 
-        # Tentative 2 : préciser le driver explicitement
+        # Tentative 2 : préciser le driver explicitement avec pyogrio
         driver = driver_map.get(ext)
         if driver:
             try:
-                gdf = gpd.read_file(tmp_path, driver=driver)
+                gdf = gpd.read_file(tmp_path, engine="pyogrio", driver=driver)
                 return gdf
             except Exception:
                 pass
 
-        # Tentative 3 : forcer le moteur fiona (fallback)
-        gdf = gpd.read_file(tmp_path, engine="fiona")
+        # Tentative 3 : laisser geopandas choisir (sans spécifier fiona)
+        gdf = gpd.read_file(tmp_path)
         return gdf
 
     finally:
@@ -137,7 +140,7 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
             os.remove(tmp_path)
 
 
-# ── SIDEBAR ──────────────────────────────────────────────────────
+# ── SIDEBAR ────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
 
@@ -218,7 +221,6 @@ with st.sidebar:
     gdf_roads = None
     if roads_file:
         try:
-            # FIX : utiliser read_uploaded_file au lieu de gpd.read_file direct
             gdf_roads = read_uploaded_file(roads_file).to_crs(4326)
             st.success(f"✅ {len(gdf_roads)} tronçons chargés")
             if "Tps_min" in gdf_roads.columns:
@@ -241,7 +243,6 @@ with st.sidebar:
         up = st.file_uploader("Charger structures", type=["geojson", "json", "shp", "gpkg"])
         if up:
             try:
-                # FIX : utiliser read_uploaded_file
                 gdf = read_uploaded_file(up).to_crs(4326)
                 for i, row in gdf.iterrows():
                     geom = row.geometry
@@ -293,7 +294,7 @@ with st.sidebar:
     run_btn = st.button("🚀 Calculer les Isochrones", use_container_width=True)
 
 
-# ── FONCTIONS UTILITAIRES ─────────────────────────────────────────
+# ── FONCTIONS UTILITAIRES ───────────────────────────────────────────────────
 def get_mode_for_engine(eng, mode_label):
     modes = ENGINES[eng]["modes"]
     if mode_label in modes:
@@ -420,7 +421,7 @@ def export_shapefile(gdf_out):
     buf = io.BytesIO()
     with tempfile.TemporaryDirectory() as tmp_dir:
         out_path = os.path.join(tmp_dir, "isochrones.shp")
-        gdf_out.to_file(out_path)
+        gdf_out.to_file(out_path, engine="pyogrio")
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for fname in os.listdir(tmp_dir):
                 zf.write(os.path.join(tmp_dir, fname), arcname=fname)
@@ -428,7 +429,7 @@ def export_shapefile(gdf_out):
     return buf.read()
 
 
-# ── LAYOUT PRINCIPAL ─────────────────────────────────────────────
+# ── LAYOUT PRINCIPAL ────────────────────────────────────────────────────────
 col_map, col_info = st.columns([3, 1])
 
 with col_info:
