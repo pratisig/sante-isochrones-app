@@ -10,3 +10,4 @@ numpy>=1.26
 pandas>=2.1
 requests>=2.31
 pyogrio>=0.7
+rtree>=1.0

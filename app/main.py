@@ -14,10 +14,11 @@ import folium
 from streamlit_folium import st_folium
 from shapely.geometry import Point
 from utils import compute_isochrone, engines_metadata
+from projection import auto_utm_epsg
 import warnings
 warnings.filterwarnings("ignore")
 
-# Forcer pyogrio comme moteur GDAL (évite l'erreur fiona not installed)
+# Forcer pyogrio comme moteur GDAL
 gpd.options.io_engine = "pyogrio"
 
 st.set_page_config(
@@ -60,6 +61,11 @@ html, body, [class*="css"] { font-family: 'Satoshi', sans-serif; }
   background: #e9e0c6; color: #8a5b00; border-radius: 999px;
   padding: 2px 9px; font-size: 0.68rem; font-weight: 700;
 }
+.warn-box {
+  background: #fff8e1; border-left: 3px solid #d19900;
+  border-radius: 0 0.5rem 0.5rem 0; padding: 0.55rem 0.9rem;
+  font-size: 0.8rem; color: #28251d; margin-bottom: 0.6rem;
+}
 div[data-testid="stSidebar"] { background: #f9f8f5; border-right: 1px solid #dcd9d5; }
 div[data-testid="stButton"] > button {
   background: #01696f !important; color: white !important;
@@ -84,26 +90,12 @@ OPACITIES = [0.22, 0.19, 0.16, 0.13]
 
 # ─────────────────────────────────────────────────────────────────
 # UTILITAIRE : lecture robuste des fichiers uploadés
-#
-# Problème : un Shapefile ESRI est composé de plusieurs fichiers
-#   (.shp, .shx, .dbf, .prj, ...). Streamlit ne permet d'uploader
-#   qu'un fichier à la fois. Si l'utilisateur uploade uniquement le
-#   .shp, GDAL/pyogrio lève :
-#     "Unable to open .shx — Set SHAPE_RESTORE_SHX to YES"
-#
-# Solution retenue :
-#   • Pour un .zip  → extraire dans un dossier temporaire et trouver
-#                     le .shp à l'intérieur (tous les composants sont présents).
-#   • Pour GeoJSON / GPKG / JSON → écrire dans un fichier tmp et lire.
-#   • Pour un .shp seul → activer SHAPE_RESTORE_SHX=YES via une
-#     variable d'environnement GDAL afin de reconstruire le .shx
-#     manquant à la volée.
 # ─────────────────────────────────────────────────────────────────
 def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
     filename = uploaded_file.name
     ext = os.path.splitext(filename)[1].lower()
 
-    # ── Cas 1 : ZIP contenant un Shapefile (méthode recommandée) ──
+    # Cas 1 : ZIP contenant un Shapefile (méthode recommandée)
     if ext == ".zip":
         tmp_dir = tempfile.mkdtemp()
         try:
@@ -111,7 +103,6 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
             with zipfile.ZipFile(zip_bytes) as zf:
                 zf.extractall(tmp_dir)
 
-            # Chercher le .shp dans le répertoire extrait (récursif)
             shp_path = None
             for root, dirs, files in os.walk(tmp_dir):
                 for f in files:
@@ -121,7 +112,6 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
                 if shp_path:
                     break
 
-            # Sinon peut-être un GeoJSON ou GPKG dans le zip
             if shp_path is None:
                 for root, dirs, files in os.walk(tmp_dir):
                     for f in files:
@@ -134,7 +124,7 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
             if shp_path is None:
                 raise ValueError(
                     "Aucun fichier spatial trouvé dans le ZIP. "
-                    "Assurez-vous d'inclure le .shp et ses fichiers associés (.shx, .dbf, .prj)."
+                    "Incluez le .shp et ses fichiers associés (.shx, .dbf, .prj)."
                 )
 
             gdf = gpd.read_file(shp_path, engine="pyogrio")
@@ -142,33 +132,29 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # ── Cas 2 : Shapefile seul (.shp sans .shx) ───────────────────
+    # Cas 2 : Shapefile seul (.shp sans .shx)
     if ext == ".shp":
         tmp_dir = tempfile.mkdtemp()
         try:
             shp_path = os.path.join(tmp_dir, filename)
             with open(shp_path, "wb") as f:
                 f.write(uploaded_file.read())
-
-            # Activer la reconstruction automatique du .shx manquant
             os.environ["SHAPE_RESTORE_SHX"] = "YES"
             try:
                 gdf = gpd.read_file(shp_path, engine="pyogrio")
                 return gdf
             finally:
-                # Remettre la variable à sa valeur par défaut
                 os.environ.pop("SHAPE_RESTORE_SHX", None)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # ── Cas 3 : GeoJSON, GPKG, JSON ───────────────────────────────
+    # Cas 3 : GeoJSON, GPKG, JSON
     driver_map = {
         ".gpkg":    "GPKG",
         ".geojson": "GeoJSON",
         ".json":    "GeoJSON",
         ".kml":     "KML",
     }
-
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tmp.write(uploaded_file.read())
         tmp_path = tmp.name
@@ -179,7 +165,6 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
             return gdf
         except Exception:
             pass
-
         driver = driver_map.get(ext)
         if driver:
             try:
@@ -187,7 +172,6 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
                 return gdf
             except Exception:
                 pass
-
         gdf = gpd.read_file(tmp_path)
         return gdf
     finally:
@@ -221,16 +205,24 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
+    # Avertissement si GraphHopper sans clé
+    needs_gh = any("GraphHopper" in e for e in selected_engines)
+    if needs_gh:
+        st.markdown(
+            '<div class="warn-box">⚠️ <b>GraphHopper</b> requiert une clé API depuis 2024. '
+            'Clé gratuite sur <a href="https://www.graphhopper.com/dashboard/" target="_blank">graphhopper.com</a> (500 req/j).</div>',
+            unsafe_allow_html=True
+        )
+
     # --- Clés API
     ors_key = ""
     gh_key  = ""
     needs_ors = any("ORS" in e for e in selected_engines)
-    needs_gh  = any("GraphHopper" in e for e in selected_engines)
 
     if needs_ors:
         ors_key = st.secrets.get("ORS_API_KEY", "")
         if ors_key:
-            st.success("✅ Clé ORS chargée")
+            st.success("✅ Clé ORS chargée (secrets)")
         else:
             ors_key = st.text_input("Clé API ORS", type="password",
                 help="openrouteservice.org/dev/#/signup — gratuit 500 req/j")
@@ -238,10 +230,10 @@ with st.sidebar:
     if needs_gh:
         gh_key = st.secrets.get("GH_API_KEY", "")
         if gh_key:
-            st.success("✅ Clé GraphHopper chargée")
+            st.success("✅ Clé GraphHopper chargée (secrets)")
         else:
-            gh_key = st.text_input("Clé GraphHopper (optionnelle)", type="password",
-                help="graphhopper.com — sans clé : 500 req/j gratuits")
+            gh_key = st.text_input("Clé GraphHopper", type="password",
+                help="graphhopper.com — gratuit 500 req/j")
 
     st.divider()
 
@@ -279,10 +271,13 @@ with st.sidebar:
         try:
             gdf_roads = read_uploaded_file(roads_file).to_crs(4326)
             st.success(f"✅ {len(gdf_roads)} tronçons chargés")
+            cols_ok = [c for c in ["Tps_min", "Vit_kmh", "maxspeed", "osm_id"] if c in gdf_roads.columns]
+            if cols_ok:
+                st.caption(f"Colonnes détectées : {', '.join(cols_ok)}")
             if "Tps_min" in gdf_roads.columns:
-                st.caption(f"Tps_min moy : {gdf_roads['Tps_min'].describe()['mean']:.1f} min")
+                st.caption(f"Tps_min moy : {gdf_roads['Tps_min'].mean():.1f} min")
             if "Vit_kmh" in gdf_roads.columns:
-                st.caption(f"Vit_kmh moy : {gdf_roads['Vit_kmh'].describe()['mean']:.1f} km/h")
+                st.caption(f"Vit_kmh moy : {gdf_roads['Vit_kmh'].mean():.1f} km/h")
         except Exception as e:
             st.error(f"Erreur chargement routes : {e}")
 
@@ -368,6 +363,27 @@ def get_mode_for_engine(eng, mode_label):
     return list(modes.values())[0]
 
 
+def compute_area_safe(geometry, lon: float, lat: float) -> float:
+    """Calcule l'aire en km² de façon robuste avec fallback UTM automatique."""
+    try:
+        epsg = auto_utm_epsg(lon, lat)
+        gs = gpd.GeoSeries([geometry], crs=4326)
+        return round(gs.to_crs(epsg).area.values[0] / 1e6, 2)
+    except Exception:
+        # Fallback : approximation sphérique
+        try:
+            from shapely.geometry import mapping
+            bounds = geometry.bounds
+            dlat = bounds[3] - bounds[1]
+            dlon = bounds[2] - bounds[0]
+            lat_r = np.radians(lat)
+            km_lat = dlat * 111.32
+            km_lon = dlon * 111.32 * np.cos(lat_r)
+            return round(km_lat * km_lon, 2)
+        except Exception:
+            return None
+
+
 def compute_all(facilities, time_intervals, engines_list, mode_label,
                 iso_method, alpha_val, ors_key, gh_key, gdf_roads):
     results = []
@@ -375,7 +391,7 @@ def compute_all(facilities, time_intervals, engines_list, mode_label,
     prog  = st.progress(0)
     stat  = st.empty()
     done  = 0
-    delays = {"ORS": 1.5, "OSRM": 0.5, "Valhalla": 0.5, "GraphHopper": 0.5, "OSM": 0.0}
+    delays = {"ORS": 1.5, "OSRM": 0.8, "Valhalla": 0.5, "GraphHopper": 0.5, "OSM": 0.0}
 
     for eng in engines_list:
         m_api, m_osm = get_mode_for_engine(eng, mode_label)
@@ -530,17 +546,11 @@ with col_map:
                 st.markdown("### 📊 Résultats")
                 rows = []
                 for r in results:
-                    try:
-                        aire = round(
-                            gpd.GeoSeries([r["geometry"]], crs=4326)
-                            .to_crs(32630).area.values[0] / 1e6, 2
-                        )
-                    except Exception:
-                        aire = None
+                    aire = compute_area_safe(r["geometry"], r["lon"], r["lat"])
                     rows.append({
                         "Structure":   r["name"],
                         "Temps (min)": r["minutes"],
-                        "Aire (km²)":  aire,
+                        "Aire (km²)":  aire if aire is not None else "N/D",
                         "Moteur":      r["engine"],
                         "Mode":        mode_label
                     })
