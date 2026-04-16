@@ -83,45 +83,103 @@ OPACITIES = [0.22, 0.19, 0.16, 0.13]
 
 
 # ─────────────────────────────────────────────────────────────────
-# UTILITAIRE : lecture robuste des fichiers uploadés (fix pyogrio)
+# UTILITAIRE : lecture robuste des fichiers uploadés
+#
+# Problème : un Shapefile ESRI est composé de plusieurs fichiers
+#   (.shp, .shx, .dbf, .prj, ...). Streamlit ne permet d'uploader
+#   qu'un fichier à la fois. Si l'utilisateur uploade uniquement le
+#   .shp, GDAL/pyogrio lève :
+#     "Unable to open .shx — Set SHAPE_RESTORE_SHX to YES"
+#
+# Solution retenue :
+#   • Pour un .zip  → extraire dans un dossier temporaire et trouver
+#                     le .shp à l'intérieur (tous les composants sont présents).
+#   • Pour GeoJSON / GPKG / JSON → écrire dans un fichier tmp et lire.
+#   • Pour un .shp seul → activer SHAPE_RESTORE_SHX=YES via une
+#     variable d'environnement GDAL afin de reconstruire le .shx
+#     manquant à la volée.
 # ─────────────────────────────────────────────────────────────────
 def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
-    """
-    Lit un fichier uploadé via st.file_uploader en évitant l'erreur
-    pyogrio '/vsimem/... not recognized as a supported file format'.
-
-    Stratégie :
-      1. Écrire le contenu dans un fichier temporaire sur disque avec
-         la bonne extension (pyogrio détecte alors le format via l'extension).
-      2. Lire avec gpd.read_file(engine="pyogrio") depuis le chemin disque.
-      3. Nettoyer le fichier temporaire.
-    """
     filename = uploaded_file.name
-    ext = os.path.splitext(filename)[1].lower()  # .shp, .gpkg, .geojson, .json
+    ext = os.path.splitext(filename)[1].lower()
 
-    # Mapping extension → driver GDAL explicite (sécurité supplémentaire)
+    # ── Cas 1 : ZIP contenant un Shapefile (méthode recommandée) ──
+    if ext == ".zip":
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            zip_bytes = io.BytesIO(uploaded_file.read())
+            with zipfile.ZipFile(zip_bytes) as zf:
+                zf.extractall(tmp_dir)
+
+            # Chercher le .shp dans le répertoire extrait (récursif)
+            shp_path = None
+            for root, dirs, files in os.walk(tmp_dir):
+                for f in files:
+                    if f.lower().endswith(".shp"):
+                        shp_path = os.path.join(root, f)
+                        break
+                if shp_path:
+                    break
+
+            # Sinon peut-être un GeoJSON ou GPKG dans le zip
+            if shp_path is None:
+                for root, dirs, files in os.walk(tmp_dir):
+                    for f in files:
+                        if os.path.splitext(f)[1].lower() in (".geojson", ".json", ".gpkg"):
+                            shp_path = os.path.join(root, f)
+                            break
+                    if shp_path:
+                        break
+
+            if shp_path is None:
+                raise ValueError(
+                    "Aucun fichier spatial trouvé dans le ZIP. "
+                    "Assurez-vous d'inclure le .shp et ses fichiers associés (.shx, .dbf, .prj)."
+                )
+
+            gdf = gpd.read_file(shp_path, engine="pyogrio")
+            return gdf
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # ── Cas 2 : Shapefile seul (.shp sans .shx) ───────────────────
+    if ext == ".shp":
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            shp_path = os.path.join(tmp_dir, filename)
+            with open(shp_path, "wb") as f:
+                f.write(uploaded_file.read())
+
+            # Activer la reconstruction automatique du .shx manquant
+            os.environ["SHAPE_RESTORE_SHX"] = "YES"
+            try:
+                gdf = gpd.read_file(shp_path, engine="pyogrio")
+                return gdf
+            finally:
+                # Remettre la variable à sa valeur par défaut
+                os.environ.pop("SHAPE_RESTORE_SHX", None)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # ── Cas 3 : GeoJSON, GPKG, JSON ───────────────────────────────
     driver_map = {
-        ".shp":     "ESRI Shapefile",
         ".gpkg":    "GPKG",
         ".geojson": "GeoJSON",
         ".json":    "GeoJSON",
         ".kml":     "KML",
     }
 
-    # Créer un fichier temporaire avec la bonne extension
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tmp.write(uploaded_file.read())
         tmp_path = tmp.name
 
     try:
-        # Tentative 1 : lecture par chemin disque avec pyogrio explicite
         try:
             gdf = gpd.read_file(tmp_path, engine="pyogrio")
             return gdf
         except Exception:
             pass
 
-        # Tentative 2 : préciser le driver explicitement avec pyogrio
         driver = driver_map.get(ext)
         if driver:
             try:
@@ -130,12 +188,9 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
             except Exception:
                 pass
 
-        # Tentative 3 : laisser geopandas choisir (sans spécifier fiona)
         gdf = gpd.read_file(tmp_path)
         return gdf
-
     finally:
-        # Toujours nettoyer le fichier temporaire
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
@@ -213,10 +268,11 @@ with st.sidebar:
 
     # --- Couche routes OSM
     st.markdown("#### 🛣️ Couche Routes OSM (optionnel)")
+    st.caption("💡 Shapefile : uploader un **ZIP** contenant .shp + .shx + .dbf + .prj")
     roads_file = st.file_uploader(
-        "GeoJSON/Shapefile des routes (colonnes Tps_min, Vit_kmh, maxspeed, osm_id)",
-        type=["geojson", "json", "shp", "gpkg"],
-        help="Si fourni, les vitesses Tps_min/Vit_kmh seront utilisées pour OSM local."
+        "Routes OSM (colonnes Tps_min, Vit_kmh, maxspeed, osm_id)",
+        type=["geojson", "json", "shp", "gpkg", "zip"],
+        help="ZIP recommandé pour les Shapefiles. GeoJSON/GPKG aussi acceptés."
     )
     gdf_roads = None
     if roads_file:
@@ -234,13 +290,14 @@ with st.sidebar:
 
     # --- Structures sanitaires
     st.markdown("#### 📍 Structures Sanitaires")
+    st.caption("💡 Shapefile : uploader un **ZIP** contenant .shp + .shx + .dbf + .prj")
     input_mode = st.radio("Source", [
         "Fichier GeoJSON/Shapefile", "Saisie manuelle", "Exemple (Ouagadougou)"
     ], index=2)
 
     facilities = []
     if input_mode == "Fichier GeoJSON/Shapefile":
-        up = st.file_uploader("Charger structures", type=["geojson", "json", "shp", "gpkg"])
+        up = st.file_uploader("Charger structures", type=["geojson", "json", "shp", "gpkg", "zip"])
         if up:
             try:
                 gdf = read_uploaded_file(up).to_crs(4326)
