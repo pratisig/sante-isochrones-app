@@ -17,6 +17,9 @@ import alphashape
 import warnings
 warnings.filterwarnings("ignore")
 
+# Forcer pyogrio comme moteur GDAL (évite l'erreur fiona not installed)
+gpd.options.io_engine = "pyogrio"
+
 
 # ─────────────────────────────────────────────────────────────────
 # UTILITAIRE : lecture robuste (fix pyogrio /vsimem/)
@@ -47,22 +50,21 @@ def read_geodata(source) -> gpd.GeoDataFrame:
             raise FileNotFoundError(f"Fichier introuvable : {path}")
         ext = os.path.splitext(path)[1].lower()
         try:
-            return gpd.read_file(path)
+            return gpd.read_file(path, engine="pyogrio")
         except Exception:
             driver = driver_map.get(ext)
             if driver:
                 try:
-                    return gpd.read_file(path, driver=driver)
+                    return gpd.read_file(path, engine="pyogrio", driver=driver)
                 except Exception:
                     pass
-            return gpd.read_file(path, engine="fiona")
+            raise
 
     # ── Cas 2 : objet fichier (BytesIO, UploadedFile Streamlit, etc.)
-    # Récupérer le nom du fichier et son extension
     filename = getattr(source, "name", "file.geojson")
     ext = os.path.splitext(filename)[1].lower()
     if not ext:
-        ext = ".geojson"  # fallback si pas d'extension
+        ext = ".geojson"
 
     # Lire les bytes
     if hasattr(source, "read"):
@@ -79,16 +81,17 @@ def read_geodata(source) -> gpd.GeoDataFrame:
 
     try:
         try:
-            return gpd.read_file(tmp_path)
+            return gpd.read_file(tmp_path, engine="pyogrio")
         except Exception:
             pass
         driver = driver_map.get(ext)
         if driver:
             try:
-                return gpd.read_file(tmp_path, driver=driver)
+                return gpd.read_file(tmp_path, engine="pyogrio", driver=driver)
             except Exception:
                 pass
-        return gpd.read_file(tmp_path, engine="fiona")
+        # Dernier recours : laisser geopandas choisir (sans spécifier fiona)
+        return gpd.read_file(tmp_path)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
