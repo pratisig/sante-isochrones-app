@@ -6,7 +6,10 @@ import requests
 import json
 import time
 import io
+import os
+import shutil
 import zipfile
+import tempfile
 import folium
 from streamlit_folium import st_folium
 from shapely.geometry import Point
@@ -71,9 +74,68 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-ENGINES = engines_metadata()
-COLORS  = ["#27ae60", "#f39c12", "#e74c3c", "#8e44ad"]
+ENGINES   = engines_metadata()
+COLORS    = ["#27ae60", "#f39c12", "#e74c3c", "#8e44ad"]
 OPACITIES = [0.22, 0.19, 0.16, 0.13]
+
+
+# ─────────────────────────────────────────────────────────────────
+# UTILITAIRE : lecture robuste des fichiers uploadés (fix pyogrio)
+# ─────────────────────────────────────────────────────────────────
+def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
+    """
+    Lit un fichier uploadé via st.file_uploader en évitant l'erreur
+    pyogrio '/vsimem/... not recognized as a supported file format'.
+
+    Stratégie :
+      1. Écrire le contenu dans un fichier temporaire sur disque avec
+         la bonne extension (pyogrio détecte alors le format via l'extension).
+      2. Lire avec gpd.read_file() depuis le chemin disque.
+      3. Nettoyer le fichier temporaire.
+    """
+    filename = uploaded_file.name
+    ext = os.path.splitext(filename)[1].lower()  # .shp, .gpkg, .geojson, .json
+
+    # Mapping extension → driver GDAL explicite (sécurité supplémentaire)
+    driver_map = {
+        ".shp":     "ESRI Shapefile",
+        ".gpkg":    "GPKG",
+        ".geojson": "GeoJSON",
+        ".json":    "GeoJSON",
+        ".kml":     "KML",
+    }
+
+    # Créer un fichier temporaire avec la bonne extension
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(uploaded_file.read())
+        tmp_path = tmp.name
+
+    try:
+        # Tentative 1 : lecture par chemin disque (pyogrio détecte via ext)
+        try:
+            gdf = gpd.read_file(tmp_path)
+            return gdf
+        except Exception:
+            pass
+
+        # Tentative 2 : préciser le driver explicitement
+        driver = driver_map.get(ext)
+        if driver:
+            try:
+                gdf = gpd.read_file(tmp_path, driver=driver)
+                return gdf
+            except Exception:
+                pass
+
+        # Tentative 3 : forcer le moteur fiona (fallback)
+        gdf = gpd.read_file(tmp_path, engine="fiona")
+        return gdf
+
+    finally:
+        # Toujours nettoyer le fichier temporaire
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
 
 # ── SIDEBAR ──────────────────────────────────────────────────────
 with st.sidebar:
@@ -103,7 +165,7 @@ with st.sidebar:
 
     # --- Clés API
     ors_key = ""
-    gh_key = ""
+    gh_key  = ""
     needs_ors = any("ORS" in e for e in selected_engines)
     needs_gh  = any("GraphHopper" in e for e in selected_engines)
 
@@ -125,7 +187,7 @@ with st.sidebar:
 
     st.divider()
 
-    # --- Mode de transport (basé sur moteur principal)
+    # --- Mode de transport
     st.markdown("#### 🚶 Mode de Transport")
     modes_available = meta["modes"]
     mode_label = st.selectbox("Mode", list(modes_available.keys()))
@@ -146,7 +208,7 @@ with st.sidebar:
 
     st.divider()
 
-    # --- Couche routes OSM (Tps_min / Vit_kmh)
+    # --- Couche routes OSM
     st.markdown("#### 🛣️ Couche Routes OSM (optionnel)")
     roads_file = st.file_uploader(
         "GeoJSON/Shapefile des routes (colonnes Tps_min, Vit_kmh, maxspeed, osm_id)",
@@ -156,12 +218,15 @@ with st.sidebar:
     gdf_roads = None
     if roads_file:
         try:
-            gdf_roads = gpd.read_file(roads_file).to_crs(4326)
+            # FIX : utiliser read_uploaded_file au lieu de gpd.read_file direct
+            gdf_roads = read_uploaded_file(roads_file).to_crs(4326)
             st.success(f"✅ {len(gdf_roads)} tronçons chargés")
             if "Tps_min" in gdf_roads.columns:
-                st.caption(f"Tps_min: {gdf_roads['Tps_min'].describe()['mean']:.1f} min moy.")
+                st.caption(f"Tps_min moy : {gdf_roads['Tps_min'].describe()['mean']:.1f} min")
+            if "Vit_kmh" in gdf_roads.columns:
+                st.caption(f"Vit_kmh moy : {gdf_roads['Vit_kmh'].describe()['mean']:.1f} km/h")
         except Exception as e:
-            st.error(str(e))
+            st.error(f"Erreur chargement routes : {e}")
 
     st.divider()
 
@@ -176,15 +241,20 @@ with st.sidebar:
         up = st.file_uploader("Charger structures", type=["geojson", "json", "shp", "gpkg"])
         if up:
             try:
-                gdf = gpd.read_file(up).to_crs(4326)
+                # FIX : utiliser read_uploaded_file
+                gdf = read_uploaded_file(up).to_crs(4326)
                 for i, row in gdf.iterrows():
-                    if row.geometry and row.geometry.geom_type == "Point":
-                        nm = row.get("nom", row.get("name", f"Structure {i}"))
-                        facilities.append({"id": i, "name": nm,
-                                           "lon": row.geometry.x, "lat": row.geometry.y})
-                st.success(f"✅ {len(facilities)} structures")
+                    geom = row.geometry
+                    if geom is None:
+                        continue
+                    pt = geom.centroid if geom.geom_type != "Point" else geom
+                    nm = row.get("nom", row.get("name", row.get("NOM",
+                         row.get("NAME", f"Structure {i}"))))
+                    facilities.append({"id": i, "name": str(nm),
+                                       "lon": pt.x, "lat": pt.y})
+                st.success(f"✅ {len(facilities)} structures chargées")
             except Exception as e:
-                st.error(str(e))
+                st.error(f"Erreur chargement structures : {e}")
     elif input_mode == "Saisie manuelle":
         raw = st.text_area("nom, lon, lat (une par ligne)",
             "CS Bogodogo, -1.5312, 12.3345\nHôpital Yalgado, -1.5167, 12.3611",
@@ -195,7 +265,8 @@ with st.sidebar:
                 try:
                     facilities.append({"id": i, "name": p[0].strip(),
                                        "lon": float(p[1]), "lat": float(p[2])})
-                except: pass
+                except Exception:
+                    pass
         if facilities:
             st.success(f"✅ {len(facilities)} structures")
     else:
@@ -224,16 +295,13 @@ with st.sidebar:
 
 # ── FONCTIONS UTILITAIRES ─────────────────────────────────────────
 def get_mode_for_engine(eng, mode_label):
-    """Retourne (mode_api, mode_osm) pour un moteur donné, avec fallback."""
     modes = ENGINES[eng]["modes"]
-    # Cherche le même label, sinon prend le premier disponible
     if mode_label in modes:
         return modes[mode_label]
-    # Fallback : mapping générique
     fallbacks = {
-        "walk": ["🚶 Marche", "🥾 Randonnée"],
+        "walk":  ["🚶 Marche", "🥾 Randonnée"],
         "drive": ["🚗 Voiture", "🚗 Véhicule"],
-        "bike": ["🚲 Vélo"],
+        "bike":  ["🚲 Vélo"],
     }
     for fb_list in fallbacks.values():
         for fb in fb_list:
@@ -246,9 +314,9 @@ def compute_all(facilities, time_intervals, engines_list, mode_label,
                 iso_method, alpha_val, ors_key, gh_key, gdf_roads):
     results = []
     total = len(facilities) * len(time_intervals) * len(engines_list)
-    prog = st.progress(0)
-    stat = st.empty()
-    done = 0
+    prog  = st.progress(0)
+    stat  = st.empty()
+    done  = 0
     delays = {"ORS": 1.5, "OSRM": 0.5, "Valhalla": 0.5, "GraphHopper": 0.5, "OSM": 0.0}
 
     for eng in engines_list:
@@ -273,7 +341,6 @@ def compute_all(facilities, time_intervals, engines_list, mode_label,
                 except Exception as e:
                     st.warning(f"⚠️ {eng.split('—')[0].strip()} | {fac['name']} {mins} min : {e}")
 
-                # Délai anti-rate-limit
                 for k, d in delays.items():
                     if k in eng:
                         time.sleep(d)
@@ -291,7 +358,6 @@ def build_map(facilities, results, time_intervals, compare_mode, engines_list):
     m = folium.Map(location=[clat, clon], zoom_start=11, tiles="CartoDB positron")
 
     if compare_mode and len(engines_list) > 1:
-        # Couches par moteur
         engine_colors = {e: COLORS[i % len(COLORS)] for i, e in enumerate(engines_list)}
         for eng in engines_list:
             short = eng.split("—")[0].strip()
@@ -310,7 +376,6 @@ def build_map(facilities, results, time_intervals, compare_mode, engines_list):
                     ).add_to(layer)
             layer.add_to(m)
     else:
-        # Couches par intervalle de temps
         for i, mins in enumerate(sorted(time_intervals, reverse=True)):
             color = COLORS[i % len(COLORS)]
             layer = folium.FeatureGroup(name=f"⏱ {mins} min", show=True)
@@ -325,7 +390,6 @@ def build_map(facilities, results, time_intervals, compare_mode, engines_list):
                 ).add_to(layer)
             layer.add_to(m)
 
-    # Marqueurs structures
     markers = folium.FeatureGroup(name="🏥 Structures", show=True)
     for fac in facilities:
         folium.Marker(
@@ -337,7 +401,6 @@ def build_map(facilities, results, time_intervals, compare_mode, engines_list):
     markers.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
 
-    # Légende
     if compare_mode and len(engines_list) > 1:
         legend = '<div style="position:fixed;bottom:30px;left:30px;z-index:9999;background:white;padding:12px 16px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.15);font-size:13px;"><b>Moteurs</b><br>'
         for i, eng in enumerate(engines_list):
@@ -354,17 +417,13 @@ def build_map(facilities, results, time_intervals, compare_mode, engines_list):
 
 
 def export_shapefile(gdf_out):
-    """Retourne un ZIP bytes contenant le Shapefile."""
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        tmp_dir = "/tmp/iso_shp"
-        import os, shutil
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir)
-        os.makedirs(tmp_dir)
-        gdf_out.to_file(f"{tmp_dir}/isochrones.shp")
-        for fname in os.listdir(tmp_dir):
-            zf.write(f"{tmp_dir}/{fname}", arcname=fname)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        out_path = os.path.join(tmp_dir, "isochrones.shp")
+        gdf_out.to_file(out_path)
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname in os.listdir(tmp_dir):
+                zf.write(os.path.join(tmp_dir, fname), arcname=fname)
     buf.seek(0)
     return buf.read()
 
@@ -381,7 +440,6 @@ with col_info:
             f'<small>{meta["description"]}</small></div>',
             unsafe_allow_html=True
         )
-
     if compare_mode:
         st.markdown(
             '<div style="margin-top:0.5rem;"><span class="compare-tag">MODE COMPARAISON</span>'
@@ -419,19 +477,18 @@ with col_map:
                             gpd.GeoSeries([r["geometry"]], crs=4326)
                             .to_crs(32630).area.values[0] / 1e6, 2
                         )
-                    except:
+                    except Exception:
                         aire = None
                     rows.append({
-                        "Structure": r["name"],
+                        "Structure":   r["name"],
                         "Temps (min)": r["minutes"],
-                        "Aire (km²)": aire,
-                        "Moteur": r["engine"],
-                        "Mode": mode_label
+                        "Aire (km²)":  aire,
+                        "Moteur":      r["engine"],
+                        "Mode":        mode_label
                     })
                 df = pd.DataFrame(rows)
                 st.dataframe(df, use_container_width=True)
 
-                # Export
                 gdf_out = gpd.GeoDataFrame(
                     df.copy(),
                     geometry=[r["geometry"] for r in results],

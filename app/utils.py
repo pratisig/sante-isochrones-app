@@ -2,6 +2,8 @@
 utils.py — Fonctions utilitaires pour le calcul d'isochrones
 Moteurs : OSMnx (local), ORS (API), OSRM (public), Valhalla (public), GraphHopper (API gratuite)
 """
+import os
+import tempfile
 import numpy as np
 import networkx as nx
 import osmnx as ox
@@ -10,9 +12,86 @@ import json
 import time
 from shapely.geometry import Point, shape
 from shapely.ops import unary_union
+import geopandas as gpd
 import alphashape
 import warnings
 warnings.filterwarnings("ignore")
+
+
+# ─────────────────────────────────────────────────────────────────
+# UTILITAIRE : lecture robuste (fix pyogrio /vsimem/)
+# ─────────────────────────────────────────────────────────────────
+def read_geodata(source) -> gpd.GeoDataFrame:
+    """
+    Lit une source géospatiale de manière robuste :
+    - str/Path  : chemin disque direct (pyogrio lit via ext)
+    - BytesIO   : écrit dans un tmpfile avec la bonne extension
+    - UploadedFile (Streamlit) : idem BytesIO
+
+    Évite l'erreur pyogrio '/vsimem/... not recognized'.
+    """
+    import io
+
+    driver_map = {
+        ".shp":     "ESRI Shapefile",
+        ".gpkg":    "GPKG",
+        ".geojson": "GeoJSON",
+        ".json":    "GeoJSON",
+        ".kml":     "KML",
+    }
+
+    # ── Cas 1 : chemin disque (str ou Path)
+    if isinstance(source, (str, os.PathLike)):
+        path = os.path.abspath(str(source))
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Fichier introuvable : {path}")
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            return gpd.read_file(path)
+        except Exception:
+            driver = driver_map.get(ext)
+            if driver:
+                try:
+                    return gpd.read_file(path, driver=driver)
+                except Exception:
+                    pass
+            return gpd.read_file(path, engine="fiona")
+
+    # ── Cas 2 : objet fichier (BytesIO, UploadedFile Streamlit, etc.)
+    # Récupérer le nom du fichier et son extension
+    filename = getattr(source, "name", "file.geojson")
+    ext = os.path.splitext(filename)[1].lower()
+    if not ext:
+        ext = ".geojson"  # fallback si pas d'extension
+
+    # Lire les bytes
+    if hasattr(source, "read"):
+        raw = source.read()
+    elif hasattr(source, "getvalue"):
+        raw = source.getvalue()
+    else:
+        raise TypeError(f"Type de source non supporté : {type(source)}")
+
+    # Écrire dans un fichier temporaire avec la bonne extension
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+
+    try:
+        try:
+            return gpd.read_file(tmp_path)
+        except Exception:
+            pass
+        driver = driver_map.get(ext)
+        if driver:
+            try:
+                return gpd.read_file(tmp_path, driver=driver)
+            except Exception:
+                pass
+        return gpd.read_file(tmp_path, engine="fiona")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -40,20 +119,28 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
             oid = row.get("osm_id")
             if oid is None:
                 continue
-            # Priorité : Vit_kmh > maxspeed > défaut
             v = None
-            if "Vit_kmh" in row and row["Vit_kmh"] and not np.isnan(float(row["Vit_kmh"])):
-                v = float(row["Vit_kmh"])
-            elif "maxspeed" in row and row["maxspeed"]:
-                try:
-                    v = float(str(row["maxspeed"]).split()[0])
-                except (ValueError, TypeError):
-                    pass
+            for col in ("Vit_kmh", "vit_kmh", "vitesse_kmh"):
+                val = row.get(col)
+                if val is not None:
+                    try:
+                        fval = float(val)
+                        if not np.isnan(fval) and fval > 0:
+                            v = fval
+                            break
+                    except (ValueError, TypeError):
+                        pass
+            if v is None:
+                ms = row.get("maxspeed") or row.get("MAXSPEED")
+                if ms:
+                    try:
+                        v = float(str(ms).split()[0])
+                    except (ValueError, TypeError):
+                        pass
             if v:
                 road_speeds[str(oid)] = v
 
     for u, v_node, d in G.edges(data=True):
-        # Cherche la vitesse dans la couche OSM via osmid
         edge_speed = spd
         osmid = str(d.get("osmid", ""))
         if osmid in road_speeds:
@@ -69,6 +156,23 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
                     pass
         length = d.get("length", 1)
         d["travel_time"] = length / (max(edge_speed, 1) * 1000 / 3600)
+
+    # Utiliser Tps_min si disponible pour pondérer le graphe
+    if gdf_roads is not None and "Tps_min" in gdf_roads.columns:
+        tps_map = {}
+        for _, row in gdf_roads.iterrows():
+            oid = row.get("osm_id")
+            tps = row.get("Tps_min")
+            if oid is not None and tps is not None:
+                try:
+                    tps_map[str(oid)] = float(tps) * 60  # convertir en secondes
+                except (ValueError, TypeError):
+                    pass
+        if tps_map:
+            for u, v_node, d in G.edges(data=True):
+                osmid = str(d.get("osmid", ""))
+                if osmid in tps_map:
+                    d["travel_time"] = tps_map[osmid]
 
     sub = nx.ego_graph(G, center, radius=minutes * 60, distance="travel_time")
     pts = [Point(G.nodes[n]["x"], G.nodes[n]["y"]) for n in sub.nodes()]
@@ -161,15 +265,10 @@ def isochrone_valhalla(lon: float, lat: float, minutes: int, costing: str):
 
 
 # ─────────────────────────────────────────────────────────────────
-# 5. GraphHopper (API gratuite — 500 req/jour sans clé, ou avec clé)
+# 5. GraphHopper
 # ─────────────────────────────────────────────────────────────────
 def isochrone_graphhopper(lon: float, lat: float, minutes: int,
                           profile: str, key: str = ""):
-    """
-    GraphHopper Isochrones API.
-    Sans clé : 500 req/jour sur graphhopper.com/api/1/
-    Profiles : car | bike | foot | motorcycle | hike | mtb | racingbike
-    """
     url = "https://graphhopper.com/api/1/isochrone"
     params = {
         "point": f"{lat},{lon}",
@@ -200,7 +299,13 @@ def compute_isochrone(engine: str, lon: float, lat: float, minutes: int,
                       gdf_roads=None):
     """
     Point d'entrée unique. Retourne un shapely Polygon/MultiPolygon.
+    gdf_roads peut être un GeoDataFrame déjà chargé ou un chemin/fichier
+    (sera lu via read_geodata si nécessaire).
     """
+    # Charger gdf_roads si c'est un chemin ou un fichier uploadé
+    if gdf_roads is not None and not hasattr(gdf_roads, "geometry"):
+        gdf_roads = read_geodata(gdf_roads).to_crs(4326)
+
     if "OSM local" in engine:
         return compute_osmnx_isochrone(lon, lat, minutes, mode_osm,
                                        iso_method, alpha, gdf_roads)
@@ -226,9 +331,9 @@ def engines_metadata() -> dict:
             "description": "100% local. Lit les colonnes Tps_min, Vit_kmh, maxspeed de votre couche OSM.",
             "needs_key": False,
             "modes": {
-                "🚶 Marche": ("walk", "walk"),
+                "🚶 Marche":   ("walk",  "walk"),
                 "🚗 Véhicule": ("drive", "drive"),
-                "🚲 Vélo": ("bike", "bike"),
+                "🚲 Vélo":     ("bike",  "bike"),
             },
         },
         "OpenRouteService (ORS) — Clé API": {
@@ -237,10 +342,10 @@ def engines_metadata() -> dict:
             "needs_key": True, "key_name": "ORS_API_KEY",
             "key_url": "https://openrouteservice.org/dev/#/signup",
             "modes": {
-                "🚶 Marche": ("foot-walking", "walk"),
-                "🚗 Voiture": ("driving-car", "drive"),
-                "🚲 Vélo": ("cycling-regular", "bike"),
-                "🛵 HGV": ("driving-hgv", "drive"),
+                "🚶 Marche":  ("foot-walking",   "walk"),
+                "🚗 Voiture": ("driving-car",    "drive"),
+                "🚲 Vélo":    ("cycling-regular", "bike"),
+                "🛵 HGV":     ("driving-hgv",    "drive"),
             },
         },
         "OSRM Public — Gratuit": {
@@ -248,9 +353,9 @@ def engines_metadata() -> dict:
             "description": "Sans clé. Isochrones approx. via matrice de durées OSRM.",
             "needs_key": False,
             "modes": {
-                "🚗 Voiture": ("car", "drive"),
-                "🚲 Vélo": ("bike", "bike"),
-                "🚶 Marche": ("foot", "walk"),
+                "🚗 Voiture": ("car",  "drive"),
+                "🚲 Vélo":    ("bike", "bike"),
+                "🚶 Marche":  ("foot", "walk"),
             },
         },
         "Valhalla Public — Gratuit": {
@@ -258,23 +363,23 @@ def engines_metadata() -> dict:
             "description": "valhalla.openstreetmap.de — polygones précis, 4 modes, sans clé.",
             "needs_key": False,
             "modes": {
-                "🚶 Marche": ("pedestrian", "walk"),
-                "🚗 Voiture": ("auto", "drive"),
-                "🚲 Vélo": ("bicycle", "bike"),
-                "🛵 Moto": ("motorcycle", "drive"),
+                "🚶 Marche":  ("pedestrian", "walk"),
+                "🚗 Voiture": ("auto",       "drive"),
+                "🚲 Vélo":    ("bicycle",    "bike"),
+                "🛵 Moto":    ("motorcycle", "drive"),
             },
         },
         "GraphHopper — Gratuit (500 req/j)": {
             "badge_class": "badge-free", "badge_label": "GRATUIT",
-            "description": "graphhopper.com — polygones précis, sans clé (500 req/j). Clé optionnelle pour plus.",
+            "description": "graphhopper.com — polygones précis, sans clé (500 req/j). Clé optionnelle.",
             "needs_key": False, "key_name": "GH_API_KEY",
             "key_url": "https://www.graphhopper.com/dashboard/",
             "modes": {
-                "🚗 Voiture": ("car", "drive"),
-                "🚶 Marche": ("foot", "walk"),
-                "🚲 Vélo": ("bike", "bike"),
-                "🛵 Moto": ("motorcycle", "drive"),
-                "🥾 Randonnée": ("hike", "walk"),
+                "🚗 Voiture":    ("car",          "drive"),
+                "🚶 Marche":     ("foot",         "walk"),
+                "🚲 Vélo":       ("bike",         "bike"),
+                "🛵 Moto":       ("motorcycle",   "drive"),
+                "🥾 Randonnée":  ("hike",         "walk"),
             },
         },
     }
