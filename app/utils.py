@@ -17,6 +17,8 @@ import alphashape
 import warnings
 warnings.filterwarnings("ignore")
 
+from projection import auto_utm_epsg, auto_utm_epsg_from_gdf, reproject_to_utm, compute_area_km2
+
 # Forcer pyogrio comme moteur GDAL (évite l'erreur fiona not installed)
 gpd.options.io_engine = "pyogrio"
 
@@ -26,12 +28,8 @@ gpd.options.io_engine = "pyogrio"
 # ─────────────────────────────────────────────────────────────────
 def read_geodata(source) -> gpd.GeoDataFrame:
     """
-    Lit une source géospatiale de manière robuste :
-    - str/Path  : chemin disque direct (pyogrio lit via ext)
-    - BytesIO   : écrit dans un tmpfile avec la bonne extension
-    - UploadedFile (Streamlit) : idem BytesIO
-
-    Évite l'erreur pyogrio '/vsimem/... not recognized'.
+    Lit une source géospatiale de manière robuste.
+    Retourne un GeoDataFrame avec le CRS d'origine préservé (pas de reprojection forcée ici).
     """
     import io
 
@@ -66,7 +64,6 @@ def read_geodata(source) -> gpd.GeoDataFrame:
     if not ext:
         ext = ".geojson"
 
-    # Lire les bytes
     if hasattr(source, "read"):
         raw = source.read()
     elif hasattr(source, "getvalue"):
@@ -74,7 +71,6 @@ def read_geodata(source) -> gpd.GeoDataFrame:
     else:
         raise TypeError(f"Type de source non supporté : {type(source)}")
 
-    # Écrire dans un fichier temporaire avec la bonne extension
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tmp.write(raw)
         tmp_path = tmp.name
@@ -90,7 +86,6 @@ def read_geodata(source) -> gpd.GeoDataFrame:
                 return gpd.read_file(tmp_path, engine="pyogrio", driver=driver)
             except Exception:
                 pass
-        # Dernier recours : laisser geopandas choisir (sans spécifier fiona)
         return gpd.read_file(tmp_path)
     finally:
         if os.path.exists(tmp_path):
@@ -107,6 +102,7 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
     Calcule un isochrone localement via OSMnx + NetworkX.
     Si gdf_roads est fourni (couche OSM avec Tps_min/Vit_kmh/maxspeed),
     les vitesses sont lues depuis les attributs de la couche.
+    La couche est automatiquement reprojtée en WGS84 si nécessaire.
     """
     DEFAULT_SPEEDS = {"walk": 4.5, "bike": 15.0, "drive": 40.0}
     spd = DEFAULT_SPEEDS.get(mode, 4.5)
@@ -114,6 +110,11 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
 
     G = ox.graph_from_point((lat, lon), dist=dist, network_type=mode, simplify=True)
     center = ox.nearest_nodes(G, lon, lat)
+
+    # Assurer que gdf_roads est en WGS84 pour l'extraction des attributs
+    if gdf_roads is not None and hasattr(gdf_roads, "crs") and gdf_roads.crs:
+        if gdf_roads.crs.to_epsg() != 4326:
+            gdf_roads = gdf_roads.to_crs(4326)
 
     # Dictionnaire osm_id -> vitesse depuis la couche OSM chargée
     road_speeds = {}
@@ -168,7 +169,7 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
             tps = row.get("Tps_min")
             if oid is not None and tps is not None:
                 try:
-                    tps_map[str(oid)] = float(tps) * 60  # convertir en secondes
+                    tps_map[str(oid)] = float(tps) * 60
                 except (ValueError, TypeError):
                     pass
         if tps_map:
@@ -302,12 +303,17 @@ def compute_isochrone(engine: str, lon: float, lat: float, minutes: int,
                       gdf_roads=None):
     """
     Point d'entrée unique. Retourne un shapely Polygon/MultiPolygon.
-    gdf_roads peut être un GeoDataFrame déjà chargé ou un chemin/fichier
-    (sera lu via read_geodata si nécessaire).
+    gdf_roads peut être un GeoDataFrame déjà chargé ou un chemin/fichier.
+    La reprojection UTM est gérée automatiquement si nécessaire.
     """
     # Charger gdf_roads si c'est un chemin ou un fichier uploadé
     if gdf_roads is not None and not hasattr(gdf_roads, "geometry"):
-        gdf_roads = read_geodata(gdf_roads).to_crs(4326)
+        gdf_roads = read_geodata(gdf_roads)
+
+    # Reprojeter en WGS84 pour les moteurs API et OSMnx
+    if gdf_roads is not None and hasattr(gdf_roads, "crs") and gdf_roads.crs:
+        if gdf_roads.crs.to_epsg() != 4326:
+            gdf_roads = gdf_roads.to_crs(4326)
 
     if "OSM local" in engine:
         return compute_osmnx_isochrone(lon, lat, minutes, mode_osm,
