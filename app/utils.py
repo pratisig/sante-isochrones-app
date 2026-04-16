@@ -1,8 +1,9 @@
 """
 utils.py — Fonctions utilitaires pour le calcul d'isochrones
-Moteurs : OSMnx (local), ORS (API), OSRM (public), Valhalla (public), GraphHopper (API)
+Moteurs : OSMnx (local), OSM Pur Tps_min, ORS (API), OSRM (public), Valhalla (public), GraphHopper (API)
 """
 import os
+import math
 import tempfile
 import numpy as np
 import networkx as nx
@@ -10,8 +11,9 @@ import osmnx as ox
 import requests
 import json
 import time
-from shapely.geometry import Point, Polygon, MultiPolygon, shape
+from shapely.geometry import Point, Polygon, MultiPolygon, shape, mapping
 from shapely.ops import unary_union
+from shapely.validation import make_valid
 import geopandas as gpd
 import alphashape
 import warnings
@@ -19,7 +21,6 @@ warnings.filterwarnings("ignore")
 
 from projection import auto_utm_epsg, auto_utm_epsg_from_gdf, reproject_to_utm, compute_area_km2
 
-# Forcer pyogrio comme moteur GDAL
 gpd.options.io_engine = "pyogrio"
 
 
@@ -27,10 +28,6 @@ gpd.options.io_engine = "pyogrio"
 # UTILITAIRE : lecture robuste
 # ─────────────────────────────────────────────────────────────────
 def read_geodata(source) -> gpd.GeoDataFrame:
-    """
-    Lit une source géospatiale de manière robuste.
-    Retourne un GeoDataFrame avec le CRS d'origine préservé.
-    """
     driver_map = {
         ".shp":     "ESRI Shapefile",
         ".gpkg":    "GPKG",
@@ -38,7 +35,6 @@ def read_geodata(source) -> gpd.GeoDataFrame:
         ".json":    "GeoJSON",
         ".kml":     "KML",
     }
-
     if isinstance(source, (str, os.PathLike)):
         path = os.path.abspath(str(source))
         if not os.path.exists(path):
@@ -89,6 +85,65 @@ def read_geodata(source) -> gpd.GeoDataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────
+# UTILITAIRE : nettoyage et validation géométrie
+# ─────────────────────────────────────────────────────────────────
+def clean_geometry(geom):
+    """Valide et répare une géométrie shapely."""
+    if geom is None or geom.is_empty:
+        return None
+    if not geom.is_valid:
+        geom = make_valid(geom)
+    return geom if not geom.is_empty else None
+
+
+def build_polygon_from_points(pts: list, method: str, alpha: float):
+    """
+    Construit un polygone robuste depuis une liste de Points shapely.
+    Essaie alpha shape → convex hull → buffer union selon la méthode.
+    """
+    if len(pts) < 3:
+        return None
+    coords = np.array([(p.x, p.y) for p in pts])
+
+    if method == "Alpha Shape (recommandé)":
+        try:
+            poly = alphashape.alphashape(coords, alpha)
+            poly = clean_geometry(poly)
+            if poly and not poly.is_empty:
+                return poly
+        except Exception:
+            pass
+        # fallback convex hull
+        hull = unary_union(pts).convex_hull
+        return clean_geometry(hull)
+
+    elif method == "Convex Hull":
+        hull = unary_union(pts).convex_hull
+        return clean_geometry(hull)
+
+    elif method == "Buffer sur noeuds":
+        # Rayon adaptatif selon la densité des points
+        if len(coords) > 0:
+            # Calcul du rayon médian inter-points
+            from scipy.spatial.distance import cdist
+            try:
+                dists = cdist(coords[:min(50, len(coords))], coords[:min(50, len(coords))])
+                np.fill_diagonal(dists, np.inf)
+                median_dist = np.median(dists.min(axis=1))
+                buf_deg = max(0.0005, min(median_dist * 2, 0.01))
+            except Exception:
+                buf_deg = 0.001
+        else:
+            buf_deg = 0.001
+        merged = unary_union([p.buffer(buf_deg) for p in pts])
+        return clean_geometry(merged)
+
+    else:
+        hull = unary_union(pts).convex_hull
+        return clean_geometry(hull)
+
+
+# ─────────────────────────────────────────────────────────────────
 # 1. OSMnx local — avec support colonnes Tps_min / Vit_kmh
 # ─────────────────────────────────────────────────────────────────
 def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
@@ -97,35 +152,36 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
     """
     Calcule un isochrone localement via OSMnx + NetworkX.
     Si gdf_roads est fourni (couche OSM avec Tps_min/Vit_kmh/maxspeed),
-    les vitesses sont lues depuis les attributs de la couche.
+    les vitesses/temps sont enrichis depuis les attributs de la couche.
     """
-    # Vitesses par défaut (km/h) selon le mode
     DEFAULT_SPEEDS = {"walk": 4.5, "bike": 15.0, "drive": 40.0}
     spd = DEFAULT_SPEEDS.get(mode, 4.5)
 
-    # Rayon de téléchargement adaptatif : distance max atteignable + marge 20%
-    # On majore de 50% pour les modes rapides afin de ne pas tronquer le graphe
-    dist = int((minutes / 60) * spd * 1000 * 1.5) + 500
-    dist = max(dist, 800)   # minimum 800 m pour les petits intervalles
-    dist = min(dist, 80000) # maximum 80 km pour éviter les téléchargements géants
+    dist = int((minutes / 60) * spd * 1000 * 1.6) + 600
+    dist = max(dist, 1000)
+    dist = min(dist, 80000)
 
     G = ox.graph_from_point((lat, lon), dist=dist, network_type=mode, simplify=True)
     center = ox.nearest_nodes(G, lon, lat)
 
-    # Assurer que gdf_roads est en WGS84
     if gdf_roads is not None and hasattr(gdf_roads, "crs") and gdf_roads.crs:
         if gdf_roads.crs.to_epsg() != 4326:
             gdf_roads = gdf_roads.to_crs(4326)
 
-    # Dictionnaire osm_id -> vitesse depuis la couche OSM chargée
-    road_speeds = {}
+    # Construire dictionnaires de lookup depuis la couche locale
+    road_speeds = {}  # osm_id -> vitesse km/h
+    road_times  = {}  # osm_id -> temps en secondes
+
     if gdf_roads is not None:
         for _, row in gdf_roads.iterrows():
-            oid = row.get("osm_id")
+            oid = row.get("osm_id") or row.get("OSM_ID")
             if oid is None:
                 continue
+            oid = str(oid)
+
+            # Vitesse
             v = None
-            for col in ("Vit_kmh", "vit_kmh", "vitesse_kmh"):
+            for col in ("Vit_kmh", "vit_kmh", "vitesse_kmh", "speed_kmh"):
                 val = row.get(col)
                 if val is not None:
                     try:
@@ -143,17 +199,34 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
                     except (ValueError, TypeError):
                         pass
             if v:
-                road_speeds[str(oid)] = v
+                road_speeds[oid] = v
+
+            # Temps direct (Tps_min)
+            for col in ("Tps_min", "tps_min", "time_min", "duree_min"):
+                val = row.get(col)
+                if val is not None:
+                    try:
+                        fval = float(val)
+                        if not np.isnan(fval) and fval > 0:
+                            road_times[oid] = fval * 60  # → secondes
+                            break
+                    except (ValueError, TypeError):
+                        pass
 
     # Calculer travel_time sur chaque arête
     for u, v_node, d in G.edges(data=True):
-        edge_speed = spd
         osmid = str(d.get("osmid", ""))
-        # Priorité 1 : osmid dans la couche locale
-        if osmid in road_speeds:
-            edge_speed = road_speeds[osmid]
-        else:
-            # Priorité 2 : attribut maxspeed de l'arête OSM
+
+        # Priorité 1 : Tps_min de la couche locale
+        if osmid in road_times:
+            d["travel_time"] = road_times[osmid]
+            continue
+
+        # Priorité 2 : vitesse de la couche locale
+        edge_speed = road_speeds.get(osmid, spd)
+
+        # Priorité 3 : maxspeed de l'attribut OSM
+        if osmid not in road_speeds:
             ms = d.get("maxspeed")
             if isinstance(ms, list):
                 ms = ms[0]
@@ -162,55 +235,157 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
                     edge_speed = float(str(ms).split()[0])
                 except (ValueError, TypeError):
                     pass
+
         length = d.get("length", 1)
         d["travel_time"] = length / (max(edge_speed, 1) * 1000 / 3600)
 
-    # Priorité 3 : remplacer travel_time par Tps_min de la couche si disponible
-    if gdf_roads is not None and "Tps_min" in gdf_roads.columns:
-        tps_map = {}
-        for _, row in gdf_roads.iterrows():
-            oid = row.get("osm_id")
-            tps = row.get("Tps_min")
-            if oid is not None and tps is not None:
-                try:
-                    tps_map[str(oid)] = float(tps) * 60  # minutes → secondes
-                except (ValueError, TypeError):
-                    pass
-        if tps_map:
-            for u, v_node, d in G.edges(data=True):
-                osmid = str(d.get("osmid", ""))
-                if osmid in tps_map:
-                    d["travel_time"] = tps_map[osmid]
-
-    # Sous-graphe accessible en 'minutes' secondes depuis le centre
-    sub = nx.ego_graph(G, center, radius=minutes * 60, distance="travel_time")
+    # Sous-graphe accessible en 'minutes' depuis le centre
+    target_sec = minutes * 60
+    sub = nx.ego_graph(G, center, radius=target_sec, distance="travel_time")
     pts = [Point(G.nodes[n]["x"], G.nodes[n]["y"]) for n in sub.nodes()]
 
     if len(pts) < 4:
-        # Fallback : buffer circulaire
         return Point(lon, lat).buffer(0.005)
 
-    coords = np.array([(p.x, p.y) for p in pts])
-
-    if method == "Alpha Shape (recommandé)":
-        try:
-            poly = alphashape.alphashape(coords, alpha)
-            if poly and not poly.is_empty:
-                return poly
-        except Exception:
-            pass
-        # Fallback si alpha shape échoue
-        return unary_union(pts).convex_hull
-    elif method == "Convex Hull":
-        return unary_union(pts).convex_hull
-    else:  # Buffer sur noeuds
-        # Rayon de buffer proportionnel à la densité du réseau
-        buf_deg = max(0.0008, (minutes / 60) * spd * 1000 / 111000 * 0.05)
-        return unary_union([p.buffer(buf_deg) for p in pts])
+    return build_polygon_from_points(pts, method, alpha)
 
 
 # ─────────────────────────────────────────────────────────────────
-# 2. OpenRouteService
+# 2. OSM Pur — Graphe construit depuis gdf_roads (sans téléchargement)
+#    Utilise UNIQUEMENT les tronçons de la couche fournie avec Tps_min.
+#    Méthode la plus fidèle à la réalité terrain.
+# ─────────────────────────────────────────────────────────────────
+def compute_osm_pur_isochrone(lon: float, lat: float, minutes: int,
+                              gdf_roads: gpd.GeoDataFrame,
+                              method: str, alpha: float):
+    """
+    Construit un graphe NetworkX directement depuis la couche OSM locale
+    (colonnes Tps_min, Vit_kmh, maxspeed, osm_id) sans aucun téléchargement.
+    C'est la méthode la plus fidèle à la réalité terrain.
+    """
+    if gdf_roads is None or len(gdf_roads) == 0:
+        raise ValueError("La couche de routes OSM est requise pour le moteur OSM Pur.")
+
+    if gdf_roads.crs and gdf_roads.crs.to_epsg() != 4326:
+        gdf_roads = gdf_roads.to_crs(4326)
+
+    # Vérification colonnes disponibles
+    has_tps    = "Tps_min" in gdf_roads.columns
+    has_vit    = "Vit_kmh" in gdf_roads.columns
+    has_max    = "maxspeed" in gdf_roads.columns
+    has_osmid  = "osm_id" in gdf_roads.columns
+
+    G = nx.Graph()
+    node_counter = 0
+    node_map = {}  # (lon_rounded, lat_rounded) -> node_id
+
+    def get_or_create_node(x, y):
+        nonlocal node_counter
+        key = (round(x, 6), round(y, 6))
+        if key not in node_map:
+            node_map[key] = node_counter
+            G.add_node(node_counter, x=x, y=y)
+            node_counter += 1
+        return node_map[key]
+
+    for _, row in gdf_roads.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+
+        # Extraire tous les segments de la géométrie
+        if geom.geom_type == "LineString":
+            segments = [(geom.coords[i], geom.coords[i+1]) for i in range(len(geom.coords)-1)]
+        elif geom.geom_type == "MultiLineString":
+            segments = []
+            for part in geom.geoms:
+                for i in range(len(part.coords)-1):
+                    segments.append((part.coords[i], part.coords[i+1]))
+        else:
+            continue
+
+        # Calculer le travel_time pour cet tronçon
+        travel_time_sec = None
+
+        if has_tps:
+            tps = row.get("Tps_min")
+            if tps is not None:
+                try:
+                    fval = float(tps)
+                    if not np.isnan(fval) and fval > 0:
+                        travel_time_sec = fval * 60
+                except (ValueError, TypeError):
+                    pass
+
+        if travel_time_sec is None:
+            # Calculer depuis la vitesse
+            speed = 30.0  # défaut
+            if has_vit:
+                v = row.get("Vit_kmh")
+                if v is not None:
+                    try:
+                        fval = float(v)
+                        if not np.isnan(fval) and fval > 0:
+                            speed = fval
+                    except (ValueError, TypeError):
+                        pass
+            elif has_max:
+                ms = row.get("maxspeed")
+                if ms:
+                    try:
+                        speed = float(str(ms).split()[0])
+                    except (ValueError, TypeError):
+                        pass
+
+            # Calculer la longueur totale du tronçon en mètres
+            gs = gpd.GeoSeries([geom], crs=4326)
+            try:
+                epsg = auto_utm_epsg(lon, lat)
+                length_m = gs.to_crs(epsg).length.values[0]
+            except Exception:
+                length_m = geom.length * 111000  # approximation
+            travel_time_sec = length_m / (max(speed, 1) * 1000 / 3600)
+
+        # Distribuer le travel_time entre les segments
+        n_segs = len(segments)
+        time_per_seg = travel_time_sec / max(n_segs, 1)
+
+        for (x1, y1), (x2, y2) in segments:
+            u = get_or_create_node(x1, y1)
+            v = get_or_create_node(x2, y2)
+            if not G.has_edge(u, v):
+                G.add_edge(u, v, travel_time=time_per_seg)
+            else:
+                # Garder le temps le plus court (meilleure route)
+                existing = G[u][v].get("travel_time", time_per_seg)
+                G[u][v]["travel_time"] = min(existing, time_per_seg)
+
+    if G.number_of_nodes() == 0:
+        raise ValueError("Le graphe OSM local est vide. Vérifiez la couche de routes.")
+
+    # Trouver le nœud le plus proche du point source
+    nodes_xy = np.array([[G.nodes[n]["x"], G.nodes[n]["y"]] for n in G.nodes()])
+    node_ids = list(G.nodes())
+    dists = np.sqrt((nodes_xy[:, 0] - lon)**2 + (nodes_xy[:, 1] - lat)**2)
+    source_idx = np.argmin(dists)
+    source = node_ids[source_idx]
+
+    # Dijkstra depuis la source
+    target_sec = minutes * 60
+    lengths = nx.single_source_dijkstra_path_length(G, source,
+                                                     cutoff=target_sec,
+                                                     weight="travel_time")
+
+    accessible_nodes = list(lengths.keys())
+    if len(accessible_nodes) < 4:
+        return Point(lon, lat).buffer(0.005)
+
+    pts = [Point(G.nodes[n]["x"], G.nodes[n]["y"]) for n in accessible_nodes]
+    return build_polygon_from_points(pts, method, alpha)
+
+
+# ─────────────────────────────────────────────────────────────────
+# 3. OpenRouteService
 # ─────────────────────────────────────────────────────────────────
 def isochrone_ors(lon: float, lat: float, minutes: int, profile: str, key: str):
     if not key or not key.strip():
@@ -221,49 +396,57 @@ def isochrone_ors(lon: float, lat: float, minutes: int, profile: str, key: str):
         "range": [minutes * 60],
         "smoothing": 5,
         "attributes": ["area"]
-    }, headers={"Authorization": key, "Content-Type": "application/json"}, timeout=20)
+    }, headers={"Authorization": key, "Content-Type": "application/json"}, timeout=25)
     if resp.status_code == 200:
         data = resp.json()
         if "features" in data and data["features"]:
-            return shape(data["features"][0]["geometry"])
+            geom = shape(data["features"][0]["geometry"])
+            return clean_geometry(geom)
         raise Exception("ORS : réponse vide (aucune feature retournée)")
     raise Exception(f"ORS {resp.status_code}: {resp.text[:300]}")
 
 
 # ─────────────────────────────────────────────────────────────────
-# 3. OSRM Public — matrice de durées réelle (36 points autour)
-#    Méthode : on place N points sur un cercle de rayon adaptatif,
-#    on snappe chacun sur le réseau via /nearest, puis on interroge
-#    /table pour obtenir les durées réelles depuis le point central.
-#    On redimensionne chaque vecteur selon le ratio durée cible / durée réelle.
+# 4. OSRM Public — matrice de durées réelle (72 points)
+#    Méthode améliorée : 2 cercles concentriques (rayon 80% et 120%)
+#    pour mieux capturer les irrégularités du réseau routier.
 # ─────────────────────────────────────────────────────────────────
 def isochrone_osrm(lon: float, lat: float, minutes: int, profile: str):
     """
     Isochrone OSRM basé sur la vraie matrice de durées réseau.
-    Utilise le serveur public router.project-osrm.org.
+    2 couronnes × 36 points = 72 destinations pour plus de précision.
     """
     speeds = {"foot": 4.5, "bike": 15.0, "car": 50.0}
     spd = speeds.get(profile, 50.0)
 
-    # Rayon initial basé sur la vitesse — point de départ du cercle d'exploration
-    R = (minutes / 60) * spd * 1000  # mètres
-    N = 36  # points autour
-    Re = 6371000.0  # rayon terrestre en mètres
+    R_base = (minutes / 60) * spd * 1000
+    Re = 6371000.0
 
+    # 2 couronnes : 80% et 120% du rayon estimé
+    radii = [R_base * 0.8, R_base * 1.2]
+    N = 36
     angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-    dlats = [np.degrees(R / Re * np.cos(a)) for a in angles]
-    dlons = [np.degrees(R / Re * np.sin(a) / np.cos(np.radians(lat))) for a in angles]
-    dests = [(lon + dlons[i], lat + dlats[i]) for i in range(N)]
 
-    # Construire la chaîne de coordonnées : source (index 0) + destinations
+    dests = []
+    dlats_all = []
+    dlons_all = []
+
+    for R in radii:
+        dlats = [np.degrees(R / Re * np.cos(a)) for a in angles]
+        dlons = [np.degrees(R / Re * np.sin(a) / np.cos(np.radians(lat))) for a in angles]
+        for i in range(N):
+            dests.append((lon + dlons[i], lat + dlats[i]))
+            dlats_all.append(dlats[i])
+            dlons_all.append(dlons[i])
+
     coords_str = f"{lon},{lat};" + ";".join(f"{d[0]:.6f},{d[1]:.6f}" for d in dests)
-    dest_indices = ";".join(str(i + 1) for i in range(N))
+    dest_indices = ";".join(str(i + 1) for i in range(len(dests)))
 
     url = (f"http://router.project-osrm.org/table/v1/{profile}/{coords_str}"
            f"?sources=0&destinations={dest_indices}&annotations=duration")
 
     try:
-        resp = requests.get(url, timeout=30)
+        resp = requests.get(url, timeout=35)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -278,31 +461,29 @@ def isochrone_osrm(lon: float, lat: float, minutes: int, profile: str):
 
     for i, dur in enumerate(durations):
         if dur is None or dur == 0:
-            # Destination inaccessible ou co-localisée : on garde le point du cercle
             pts.append(Point(dests[i][0], dests[i][1]))
             continue
-        # Ratio : si dur > target, on rapproche le point proportionnellement
         ratio = min(1.0, target_sec / dur)
-        new_lon = lon + dlons[i] * ratio
-        new_lat = lat + dlats[i] * ratio
+        new_lon = lon + dlons_all[i] * ratio
+        new_lat = lat + dlats_all[i] * ratio
         pts.append(Point(new_lon, new_lat))
 
     if len(pts) < 3:
         return Point(lon, lat).buffer(0.005)
 
-    # Alpha shape pour un contour plus naturel que le convex hull
     coords = np.array([(p.x, p.y) for p in pts])
     try:
-        poly = alphashape.alphashape(coords, 0.3)
-        if poly and not poly.is_empty:
+        poly = alphashape.alphashape(coords, 0.25)
+        poly = clean_geometry(poly)
+        if poly:
             return poly
     except Exception:
         pass
-    return unary_union(pts).convex_hull
+    return clean_geometry(unary_union(pts).convex_hull)
 
 
 # ─────────────────────────────────────────────────────────────────
-# 4. Valhalla Public
+# 5. Valhalla Public
 # ─────────────────────────────────────────────────────────────────
 def isochrone_valhalla(lon: float, lat: float, minutes: int, costing: str):
     url = "https://valhalla1.openstreetmap.de/isochrone"
@@ -311,41 +492,38 @@ def isochrone_valhalla(lon: float, lat: float, minutes: int, costing: str):
         "costing": costing,
         "contours": [{"time": minutes, "color": "ff0000"}],
         "polygons": True,
-        "generalize": 50
+        "generalize": 30
     }
     try:
-        resp = requests.get(url, params={"json": json.dumps(body)}, timeout=30)
+        resp = requests.get(url, params={"json": json.dumps(body)}, timeout=35)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         raise Exception(f"Valhalla réseau : {e}")
 
     if "features" in data and data["features"]:
-        return shape(data["features"][0]["geometry"])
+        geom = shape(data["features"][0]["geometry"])
+        return clean_geometry(geom)
     raise Exception(f"Valhalla : réponse vide — {data.get('error', 'inconnu')}")
 
 
 # ─────────────────────────────────────────────────────────────────
-# 5. GraphHopper
-#    Depuis 2024, l'API publique sans clé requiert une inscription.
-#    On tente avec clé si fournie, sinon on lève une erreur claire.
+# 6. GraphHopper
 # ─────────────────────────────────────────────────────────────────
 def isochrone_graphhopper(lon: float, lat: float, minutes: int,
                           profile: str, key: str = ""):
     url = "https://graphhopper.com/api/1/isochrone"
     params = {
-        "point": f"{lat},{lon}",
+        "point":      f"{lat},{lon}",
         "time_limit": minutes * 60,
-        "vehicle": profile,
-        "buckets": 1,
-        "type": "json",
+        "vehicle":    profile,
+        "buckets":    1,
+        "type":       "json",
     }
     if key and key.strip():
         params["key"] = key.strip()
     else:
-        # Sans clé, GraphHopper retourne 401 depuis 2024
-        # On tente quand même (peut fonctionner sur certains endpoints publics)
-        params["key"] = ""  # header vide
+        params["key"] = ""
 
     try:
         resp = requests.get(url, params=params, timeout=25)
@@ -363,7 +541,8 @@ def isochrone_graphhopper(lon: float, lat: float, minutes: int,
     data = resp.json()
     polygons = data.get("polygons", [])
     if polygons:
-        return shape(polygons[0]["geometry"])
+        geom = shape(polygons[0]["geometry"])
+        return clean_geometry(geom)
     raise Exception("GraphHopper : aucun polygone retourné")
 
 
@@ -377,18 +556,16 @@ def compute_isochrone(engine: str, lon: float, lat: float, minutes: int,
                       gdf_roads=None):
     """
     Point d'entrée unique. Retourne un shapely Polygon/MultiPolygon.
-    gdf_roads peut être un GeoDataFrame déjà chargé ou un chemin/fichier.
     """
-    # Charger gdf_roads si c'est un chemin ou un fichier uploadé
     if gdf_roads is not None and not hasattr(gdf_roads, "geometry"):
         gdf_roads = read_geodata(gdf_roads)
-
-    # Reprojeter en WGS84 pour les moteurs API et OSMnx
     if gdf_roads is not None and hasattr(gdf_roads, "crs") and gdf_roads.crs:
         if gdf_roads.crs.to_epsg() != 4326:
             gdf_roads = gdf_roads.to_crs(4326)
 
-    if "OSM local" in engine:
+    if "OSM Pur" in engine:
+        return compute_osm_pur_isochrone(lon, lat, minutes, gdf_roads, iso_method, alpha)
+    elif "OSM local" in engine:
         return compute_osmnx_isochrone(lon, lat, minutes, mode_osm,
                                        iso_method, alpha, gdf_roads)
     elif "ORS" in engine:
@@ -408,10 +585,20 @@ def compute_isochrone(engine: str, lon: float, lat: float, minutes: int,
 # ─────────────────────────────────────────────────────────────────
 def engines_metadata() -> dict:
     return {
+        "OSM Pur (Tps_min local) — Recommandé": {
+            "badge_class": "badge-local", "badge_label": "LOCAL ★",
+            "description": "Construit le graphe 100% depuis votre couche OSM (Tps_min, Vit_kmh). Aucun téléchargement. Plus fidèle à la réalité terrain.",
+            "needs_key": False, "needs_roads": True,
+            "modes": {
+                "🚗 Véhicule": ("drive", "drive"),
+                "🚶 Marche":   ("walk",  "walk"),
+                "🚲 Vélo":     ("bike",  "bike"),
+            },
+        },
         "OSM local (OSMnx + NetworkX) — Gratuit": {
             "badge_class": "badge-local", "badge_label": "LOCAL",
-            "description": "100% local. Lit les colonnes Tps_min, Vit_kmh, maxspeed de votre couche OSM.",
-            "needs_key": False,
+            "description": "Télécharge le réseau OSM + enrichit avec votre couche (Tps_min, Vit_kmh, maxspeed).",
+            "needs_key": False, "needs_roads": False,
             "modes": {
                 "🚶 Marche":   ("walk",  "walk"),
                 "🚗 Véhicule": ("drive", "drive"),
@@ -423,6 +610,7 @@ def engines_metadata() -> dict:
             "description": "Très précis. Clé gratuite sur openrouteservice.org (500 req/jour).",
             "needs_key": True, "key_name": "ORS_API_KEY",
             "key_url": "https://openrouteservice.org/dev/#/signup",
+            "needs_roads": False,
             "modes": {
                 "🚶 Marche":  ("foot-walking",   "walk"),
                 "🚗 Voiture": ("driving-car",    "drive"),
@@ -432,8 +620,8 @@ def engines_metadata() -> dict:
         },
         "OSRM Public — Gratuit": {
             "badge_class": "badge-free", "badge_label": "GRATUIT",
-            "description": "Sans clé. Isochrones via matrice de durées réseau réelle (36 points).",
-            "needs_key": False,
+            "description": "Sans clé. 72 points de sondage (2 couronnes) pour une meilleure précision.",
+            "needs_key": False, "needs_roads": False,
             "modes": {
                 "🚗 Voiture": ("car",  "drive"),
                 "🚲 Vélo":    ("bike", "bike"),
@@ -443,7 +631,7 @@ def engines_metadata() -> dict:
         "Valhalla Public — Gratuit": {
             "badge_class": "badge-free", "badge_label": "GRATUIT",
             "description": "valhalla.openstreetmap.de — polygones précis, 4 modes, sans clé.",
-            "needs_key": False,
+            "needs_key": False, "needs_roads": False,
             "modes": {
                 "🚶 Marche":  ("pedestrian", "walk"),
                 "🚗 Voiture": ("auto",       "drive"),
@@ -456,12 +644,13 @@ def engines_metadata() -> dict:
             "description": "graphhopper.com — polygones précis. Clé requise depuis 2024 (gratuit : 500 req/j).",
             "needs_key": True, "key_name": "GH_API_KEY",
             "key_url": "https://www.graphhopper.com/dashboard/",
+            "needs_roads": False,
             "modes": {
-                "🚗 Voiture":    ("car",          "drive"),
-                "🚶 Marche":     ("foot",         "walk"),
-                "🚲 Vélo":       ("bike",         "bike"),
-                "🛵 Moto":       ("motorcycle",   "drive"),
-                "🥾 Randonnée":  ("hike",         "walk"),
+                "🚗 Voiture":   ("car",        "drive"),
+                "🚶 Marche":    ("foot",        "walk"),
+                "🚲 Vélo":      ("bike",        "bike"),
+                "🛵 Moto":      ("motorcycle",  "drive"),
+                "🥾 Randonnée": ("hike",        "walk"),
             },
         },
     }

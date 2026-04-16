@@ -18,7 +18,6 @@ from projection import auto_utm_epsg
 import warnings
 warnings.filterwarnings("ignore")
 
-# Forcer pyogrio comme moteur GDAL
 gpd.options.io_engine = "pyogrio"
 
 st.set_page_config(
@@ -34,8 +33,8 @@ st.markdown("""
 html, body, [class*="css"] { font-family: 'Satoshi', sans-serif; }
 .stApp { background: #f7f6f2; }
 .main-header {
-  background: #01696f; color: white;
-  padding: 1.2rem 1.5rem; border-radius: 0.75rem; margin-bottom: 1.5rem;
+  background: linear-gradient(135deg, #01696f 0%, #0c4e54 100%);
+  color: white; padding: 1.2rem 1.5rem; border-radius: 0.75rem; margin-bottom: 1.5rem;
 }
 .main-header h1 { margin: 0; font-size: 1.35rem; font-weight: 700; }
 .main-header p  { margin: 0.2rem 0 0; font-size: 0.83rem; opacity: 0.85; }
@@ -44,27 +43,39 @@ html, body, [class*="css"] { font-family: 'Satoshi', sans-serif; }
   border-radius: 0.7rem; padding: 0.75rem 1rem; margin-bottom: 0.45rem;
   font-size: 0.82rem;
 }
+.engine-card.recommended { border: 1.5px solid #01696f; background: #f0f7f7; }
 .engine-badge {
   display: inline-block; padding: 2px 8px; border-radius: 999px;
   font-size: 0.68rem; font-weight: 700; margin-left: 5px;
   vertical-align: middle;
 }
-.badge-api   { background: #cedcd8; color: #01696f; }
-.badge-local { background: #d4dfcc; color: #437a22; }
-.badge-free  { background: #c6d8e4; color: #006494; }
+.badge-api      { background: #cedcd8; color: #01696f; }
+.badge-local    { background: #d4dfcc; color: #437a22; }
+.badge-free     { background: #c6d8e4; color: #006494; }
 .info-box {
   background: #f3f0ec; border-left: 3px solid #01696f;
   border-radius: 0 0.5rem 0.5rem 0; padding: 0.65rem 1rem;
   font-size: 0.82rem; color: #28251d; margin-bottom: 0.9rem;
 }
-.compare-tag {
-  background: #e9e0c6; color: #8a5b00; border-radius: 999px;
-  padding: 2px 9px; font-size: 0.68rem; font-weight: 700;
-}
 .warn-box {
   background: #fff8e1; border-left: 3px solid #d19900;
   border-radius: 0 0.5rem 0.5rem 0; padding: 0.55rem 0.9rem;
   font-size: 0.8rem; color: #28251d; margin-bottom: 0.6rem;
+}
+.roads-required {
+  background: #fff3e0; border-left: 3px solid #da7101;
+  border-radius: 0 0.5rem 0.5rem 0; padding: 0.55rem 0.9rem;
+  font-size: 0.8rem; color: #28251d; margin-bottom: 0.6rem;
+}
+.stat-card {
+  background: white; border-radius: 0.6rem; padding: 0.9rem 1.1rem;
+  border: 1px solid rgba(0,0,0,0.07); text-align: center;
+}
+.stat-value { font-size: 1.5rem; font-weight: 700; color: #01696f; }
+.stat-label { font-size: 0.78rem; color: #7a7974; margin-top: 2px; }
+.compare-tag {
+  background: #e9e0c6; color: #8a5b00; border-radius: 999px;
+  padding: 2px 9px; font-size: 0.68rem; font-weight: 700;
 }
 div[data-testid="stSidebar"] { background: #f9f8f5; border-right: 1px solid #dcd9d5; }
 div[data-testid="stButton"] > button {
@@ -79,7 +90,7 @@ div[data-testid="stButton"] > button:hover { background: #0c4e54 !important; }
 st.markdown("""
 <div class="main-header">
   <h1>🗺️ Générateur d'Isochrones — Zones de Desserte</h1>
-  <p>5 moteurs : OSM local · ORS · OSRM · Valhalla · GraphHopper — Support colonnes Tps_min / Vit_kmh</p>
+  <p>6 moteurs : OSM Pur Tps_min ★ · OSMnx · ORS · OSRM (72pts) · Valhalla · GraphHopper</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -89,20 +100,18 @@ OPACITIES = [0.22, 0.19, 0.16, 0.13]
 
 
 # ─────────────────────────────────────────────────────────────────
-# UTILITAIRE : lecture robuste des fichiers uploadés
+# Lecture robuste des fichiers uploadés
 # ─────────────────────────────────────────────────────────────────
 def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
     filename = uploaded_file.name
     ext = os.path.splitext(filename)[1].lower()
 
-    # Cas 1 : ZIP contenant un Shapefile (méthode recommandée)
     if ext == ".zip":
         tmp_dir = tempfile.mkdtemp()
         try:
             zip_bytes = io.BytesIO(uploaded_file.read())
             with zipfile.ZipFile(zip_bytes) as zf:
                 zf.extractall(tmp_dir)
-
             shp_path = None
             for root, dirs, files in os.walk(tmp_dir):
                 for f in files:
@@ -111,7 +120,6 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
                         break
                 if shp_path:
                     break
-
             if shp_path is None:
                 for root, dirs, files in os.walk(tmp_dir):
                     for f in files:
@@ -120,19 +128,12 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
                             break
                     if shp_path:
                         break
-
             if shp_path is None:
-                raise ValueError(
-                    "Aucun fichier spatial trouvé dans le ZIP. "
-                    "Incluez le .shp et ses fichiers associés (.shx, .dbf, .prj)."
-                )
-
-            gdf = gpd.read_file(shp_path, engine="pyogrio")
-            return gdf
+                raise ValueError("Aucun fichier spatial trouvé dans le ZIP.")
+            return gpd.read_file(shp_path, engine="pyogrio")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Cas 2 : Shapefile seul (.shp sans .shx)
     if ext == ".shp":
         tmp_dir = tempfile.mkdtemp()
         try:
@@ -141,39 +142,28 @@ def read_uploaded_file(uploaded_file) -> gpd.GeoDataFrame:
                 f.write(uploaded_file.read())
             os.environ["SHAPE_RESTORE_SHX"] = "YES"
             try:
-                gdf = gpd.read_file(shp_path, engine="pyogrio")
-                return gdf
+                return gpd.read_file(shp_path, engine="pyogrio")
             finally:
                 os.environ.pop("SHAPE_RESTORE_SHX", None)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Cas 3 : GeoJSON, GPKG, JSON
-    driver_map = {
-        ".gpkg":    "GPKG",
-        ".geojson": "GeoJSON",
-        ".json":    "GeoJSON",
-        ".kml":     "KML",
-    }
+    driver_map = {".gpkg": "GPKG", ".geojson": "GeoJSON", ".json": "GeoJSON", ".kml": "KML"}
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tmp.write(uploaded_file.read())
         tmp_path = tmp.name
-
     try:
         try:
-            gdf = gpd.read_file(tmp_path, engine="pyogrio")
-            return gdf
+            return gpd.read_file(tmp_path, engine="pyogrio")
         except Exception:
             pass
         driver = driver_map.get(ext)
         if driver:
             try:
-                gdf = gpd.read_file(tmp_path, engine="pyogrio", driver=driver)
-                return gdf
+                return gpd.read_file(tmp_path, engine="pyogrio", driver=driver)
             except Exception:
                 pass
-        gdf = gpd.read_file(tmp_path)
-        return gdf
+        return gpd.read_file(tmp_path)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -198,18 +188,26 @@ with st.sidebar:
         engine = st.selectbox("Choisir le moteur", list(ENGINES.keys()))
         selected_engines = [engine]
 
-    # Info moteur principal
     meta = ENGINES[engine]
     st.markdown(
         f'<div class="info-box"><span class="engine-badge {meta["badge_class"]}">{meta["badge_label"]}</span> {meta["description"]}</div>',
         unsafe_allow_html=True
     )
 
-    # Avertissement si GraphHopper sans clé
+    # Avertissements
+    needs_roads_engine = any(ENGINES.get(e, {}).get("needs_roads", False) for e in selected_engines)
     needs_gh = any("GraphHopper" in e for e in selected_engines)
+    needs_ors = any("ORS" in e for e in selected_engines)
+
+    if needs_roads_engine:
+        st.markdown(
+            '<div class="roads-required">⚠️ <b>OSM Pur</b> nécessite obligatoirement la couche Routes OSM ci-dessous.</div>',
+            unsafe_allow_html=True
+        )
+
     if needs_gh:
         st.markdown(
-            '<div class="warn-box">⚠️ <b>GraphHopper</b> requiert une clé API depuis 2024. '
+            '<div class="warn-box">⚠️ <b>GraphHopper</b> requiert une clé API. '
             'Clé gratuite sur <a href="https://www.graphhopper.com/dashboard/" target="_blank">graphhopper.com</a> (500 req/j).</div>',
             unsafe_allow_html=True
         )
@@ -217,10 +215,8 @@ with st.sidebar:
     # --- Clés API
     ors_key = ""
     gh_key  = ""
-    needs_ors = any("ORS" in e for e in selected_engines)
-
     if needs_ors:
-        ors_key = st.secrets.get("ORS_API_KEY", "")
+        ors_key = st.secrets.get("ORS_API_KEY", "") if hasattr(st, 'secrets') else ""
         if ors_key:
             st.success("✅ Clé ORS chargée (secrets)")
         else:
@@ -228,7 +224,7 @@ with st.sidebar:
                 help="openrouteservice.org/dev/#/signup — gratuit 500 req/j")
 
     if needs_gh:
-        gh_key = st.secrets.get("GH_API_KEY", "")
+        gh_key = st.secrets.get("GH_API_KEY", "") if hasattr(st, 'secrets') else ""
         if gh_key:
             st.success("✅ Clé GraphHopper chargée (secrets)")
         else:
@@ -259,12 +255,12 @@ with st.sidebar:
     st.divider()
 
     # --- Couche routes OSM
-    st.markdown("#### 🛣️ Couche Routes OSM (optionnel)")
-    st.caption("💡 Shapefile : uploader un **ZIP** contenant .shp + .shx + .dbf + .prj")
+    st.markdown("#### 🛣️ Couche Routes OSM")
+    st.caption("💡 Shapefile : uploader un **ZIP** (.shp + .shx + .dbf + .prj)")
     roads_file = st.file_uploader(
-        "Routes OSM (colonnes Tps_min, Vit_kmh, maxspeed, osm_id)",
+        "Routes OSM (Tps_min, Vit_kmh, maxspeed, osm_id)",
         type=["geojson", "json", "shp", "gpkg", "zip"],
-        help="ZIP recommandé pour les Shapefiles. GeoJSON/GPKG aussi acceptés."
+        help="Requis pour OSM Pur. Optionnel pour OSMnx."
     )
     gdf_roads = None
     if roads_file:
@@ -273,11 +269,13 @@ with st.sidebar:
             st.success(f"✅ {len(gdf_roads)} tronçons chargés")
             cols_ok = [c for c in ["Tps_min", "Vit_kmh", "maxspeed", "osm_id"] if c in gdf_roads.columns]
             if cols_ok:
-                st.caption(f"Colonnes détectées : {', '.join(cols_ok)}")
+                st.caption(f"Colonnes : {', '.join(cols_ok)}")
             if "Tps_min" in gdf_roads.columns:
-                st.caption(f"Tps_min moy : {gdf_roads['Tps_min'].mean():.1f} min")
+                tps_vals = gdf_roads["Tps_min"].dropna()
+                st.caption(f"Tps_min — moy: {tps_vals.mean():.1f} min · max: {tps_vals.max():.1f} min")
             if "Vit_kmh" in gdf_roads.columns:
-                st.caption(f"Vit_kmh moy : {gdf_roads['Vit_kmh'].mean():.1f} km/h")
+                vit_vals = gdf_roads["Vit_kmh"].dropna()
+                st.caption(f"Vit_kmh — moy: {vit_vals.mean():.1f} · max: {vit_vals.max():.1f}")
         except Exception as e:
             st.error(f"Erreur chargement routes : {e}")
 
@@ -285,7 +283,7 @@ with st.sidebar:
 
     # --- Structures sanitaires
     st.markdown("#### 📍 Structures Sanitaires")
-    st.caption("💡 Shapefile : uploader un **ZIP** contenant .shp + .shx + .dbf + .prj")
+    st.caption("💡 Shapefile : uploader un **ZIP** (.shp + .shx + .dbf + .prj)")
     input_mode = st.radio("Source", [
         "Fichier GeoJSON/Shapefile", "Saisie manuelle", "Exemple (Ouagadougou)"
     ], index=2)
@@ -332,54 +330,42 @@ with st.sidebar:
 
     st.divider()
 
-    # --- Méthode géométrique (OSM local seulement)
+    # --- Méthode géométrique
     iso_method, alpha_val = "Alpha Shape (recommandé)", 0.4
-    if any("OSM local" in e for e in selected_engines):
-        st.markdown("#### 🔧 Méthode Géométrique (OSM local)")
+    local_engines = [e for e in selected_engines if "OSM" in e]
+    if local_engines:
+        st.markdown("#### 🔧 Méthode Géométrique")
         iso_method = st.selectbox("Algorithme", [
             "Alpha Shape (recommandé)", "Convex Hull", "Buffer sur noeuds"
         ])
         if iso_method == "Alpha Shape (recommandé)":
-            alpha_val = st.slider("Paramètre alpha", 0.1, 1.0, 0.4, 0.05)
+            alpha_val = st.slider("Paramètre alpha", 0.1, 1.0, 0.4, 0.05,
+                help="Plus alpha est grand, plus la forme est concave et précise. Valeur recommandée : 0.3-0.5")
 
     st.divider()
     run_btn = st.button("🚀 Calculer les Isochrones", use_container_width=True)
 
 
 # ── FONCTIONS UTILITAIRES ───────────────────────────────────────────────────
-def get_mode_for_engine(eng, mode_label):
+def get_mode_for_engine(eng, lbl):
     modes = ENGINES[eng]["modes"]
-    if mode_label in modes:
-        return modes[mode_label]
-    fallbacks = {
-        "walk":  ["🚶 Marche", "🥾 Randonnée"],
-        "drive": ["🚗 Voiture", "🚗 Véhicule"],
-        "bike":  ["🚲 Vélo"],
-    }
-    for fb_list in fallbacks.values():
-        for fb in fb_list:
-            if fb in modes:
-                return modes[fb]
+    if lbl in modes:
+        return modes[lbl]
     return list(modes.values())[0]
 
 
 def compute_area_safe(geometry, lon: float, lat: float) -> float:
-    """Calcule l'aire en km² de façon robuste avec fallback UTM automatique."""
     try:
         epsg = auto_utm_epsg(lon, lat)
         gs = gpd.GeoSeries([geometry], crs=4326)
         return round(gs.to_crs(epsg).area.values[0] / 1e6, 2)
     except Exception:
-        # Fallback : approximation sphérique
         try:
-            from shapely.geometry import mapping
             bounds = geometry.bounds
             dlat = bounds[3] - bounds[1]
             dlon = bounds[2] - bounds[0]
             lat_r = np.radians(lat)
-            km_lat = dlat * 111.32
-            km_lon = dlon * 111.32 * np.cos(lat_r)
-            return round(km_lat * km_lon, 2)
+            return round(dlat * 111.32 * dlon * 111.32 * np.cos(lat_r), 2)
         except Exception:
             return None
 
@@ -408,9 +394,9 @@ def compute_all(facilities, time_intervals, engines_list, mode_label,
                     if poly and not poly.is_empty:
                         results.append({
                             **fac,
-                            "minutes": mins,
+                            "minutes":  mins,
                             "geometry": poly,
-                            "engine": eng.split("—")[0].strip()
+                            "engine":   eng.split("—")[0].strip()
                         })
                 except Exception as e:
                     st.warning(f"⚠️ {eng.split('—')[0].strip()} | {fac['name']} {mins} min : {e}")
@@ -454,13 +440,15 @@ def build_map(facilities, results, time_intervals, compare_mode, engines_list):
             color = COLORS[i % len(COLORS)]
             layer = folium.FeatureGroup(name=f"⏱ {mins} min", show=True)
             for r in [x for x in results if x["minutes"] == mins]:
+                area_km2 = compute_area_safe(r["geometry"], r["lon"], r["lat"])
+                area_str = f" · {area_km2} km²" if area_km2 else ""
                 folium.GeoJson(
                     r["geometry"].__geo_interface__,
                     style_function=lambda x, c=color, o=OPACITIES[i % len(OPACITIES)]: {
                         "fillColor": c, "fillOpacity": o,
                         "color": c, "weight": 1.5, "opacity": 0.75
                     },
-                    tooltip=f"{r['name']} — {mins} min"
+                    tooltip=f"{r['name']} — {mins} min{area_str}"
                 ).add_to(layer)
             layer.add_to(m)
 
@@ -468,13 +456,14 @@ def build_map(facilities, results, time_intervals, compare_mode, engines_list):
     for fac in facilities:
         folium.Marker(
             [fac["lat"], fac["lon"]],
-            popup=folium.Popup(f"<b>{fac['name']}</b>", max_width=200),
+            popup=folium.Popup(f"<b>{fac['name']}</b><br>Lon: {fac['lon']:.4f}<br>Lat: {fac['lat']:.4f}", max_width=220),
             icon=folium.Icon(color="red", icon="plus", prefix="fa"),
             tooltip=fac["name"]
         ).add_to(markers)
     markers.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
 
+    # Légende
     if compare_mode and len(engines_list) > 1:
         legend = '<div style="position:fixed;bottom:30px;left:30px;z-index:9999;background:white;padding:12px 16px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.15);font-size:13px;"><b>Moteurs</b><br>'
         for i, eng in enumerate(engines_list):
@@ -502,22 +491,87 @@ def export_shapefile(gdf_out):
     return buf.read()
 
 
+def build_stats_section(results, facilities, time_intervals):
+    """Affiche les statistiques détaillées après calcul."""
+    if not results:
+        return
+
+    # Enrichir avec les aires
+    for r in results:
+        if "aire_km2" not in r:
+            r["aire_km2"] = compute_area_safe(r["geometry"], r["lon"], r["lat"])
+
+    aires = [r["aire_km2"] for r in results if r["aire_km2"] is not None]
+    n_structures = len(set(r["name"] for r in results))
+    n_zones = len(results)
+    total_aire = sum(aires) if aires else 0
+    moy_aire = np.mean(aires) if aires else 0
+
+    st.markdown("### 📊 Statistiques")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(f'<div class="stat-card"><div class="stat-value">{n_structures}</div><div class="stat-label">Structures traitées</div></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown(f'<div class="stat-card"><div class="stat-value">{n_zones}</div><div class="stat-label">Zones calculées</div></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="stat-card"><div class="stat-value">{total_aire:.1f}</div><div class="stat-label">Aire totale (km²)</div></div>', unsafe_allow_html=True)
+    with c4:
+        st.markdown(f'<div class="stat-card"><div class="stat-value">{moy_aire:.1f}</div><div class="stat-label">Aire moyenne (km²)</div></div>', unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:1rem;'></div>", unsafe_allow_html=True)
+
+    # Tableau détaillé
+    rows = []
+    for r in results:
+        rows.append({
+            "Structure":    r["name"],
+            "Lon":          round(r["lon"], 4),
+            "Lat":          round(r["lat"], 4),
+            "Temps (min)":  r["minutes"],
+            "Aire (km²)":   r["aire_km2"] if r["aire_km2"] is not None else "N/D",
+            "Moteur":       r["engine"],
+            "Mode":         mode_label,
+            "Algorithme":   iso_method,
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # Tableau pivot : structure × intervalle de temps
+    if len(time_intervals) > 1 and len(facilities) > 1:
+        st.markdown("#### Aire (km²) par structure et intervalle")
+        pivot_data = []
+        for fac in facilities:
+            row_p = {"Structure": fac["name"]}
+            for mins in time_intervals:
+                matching = [r["aire_km2"] for r in results
+                            if r["name"] == fac["name"] and r["minutes"] == mins
+                            and r["aire_km2"] is not None]
+                row_p[f"{mins} min"] = f"{np.mean(matching):.1f}" if matching else "—"
+            pivot_data.append(row_p)
+        df_pivot = pd.DataFrame(pivot_data)
+        st.dataframe(df_pivot, use_container_width=True, hide_index=True)
+
+    return df
+
+
 # ── LAYOUT PRINCIPAL ────────────────────────────────────────────────────────
 col_map, col_info = st.columns([3, 1])
 
 with col_info:
-    st.markdown("### 📡 Moteurs disponibles")
-    for eng, meta in ENGINES.items():
+    st.markdown("### 📡 Moteurs")
+    for eng, m in ENGINES.items():
+        is_rec = "OSM Pur" in eng
+        card_class = "engine-card recommended" if is_rec else "engine-card"
         st.markdown(
-            f'<div class="engine-card"><b>{eng.split("—")[0].strip()}</b>'
-            f'<span class="engine-badge {meta["badge_class"]}">{meta["badge_label"]}</span><br>'
-            f'<small>{meta["description"]}</small></div>',
+            f'<div class="{card_class}"><b>{eng.split("—")[0].strip()}</b>'
+            f'<span class="engine-badge {m["badge_class"]}">{m["badge_label"]}</span><br>'
+            f'<small>{m["description"]}</small></div>',
             unsafe_allow_html=True
         )
     if compare_mode:
         st.markdown(
             '<div style="margin-top:0.5rem;"><span class="compare-tag">MODE COMPARAISON</span>'
-            ' Les moteurs sélectionnés seront affichés en couleurs différentes.</div>',
+            ' Moteurs affichés en couleurs distinctes.</div>',
             unsafe_allow_html=True
         )
 
@@ -526,10 +580,14 @@ with col_map:
     if not run_btn:
         init_m = build_map(facilities, [], time_intervals, False, selected_engines)
         with map_ph:
-            st_folium(init_m, width=None, height=560, returned_objects=[])
+            st_folium(init_m, width=None, height=580, returned_objects=[])
     else:
+        # Validation
+        needs_roads_any = any(ENGINES.get(e, {}).get("needs_roads", False) for e in selected_engines)
         if not facilities:
             st.error("⚠️ Aucune structure définie.")
+        elif needs_roads_any and gdf_roads is None:
+            st.error("⚠️ Le moteur **OSM Pur** nécessite la couche Routes OSM. Chargez-la dans la sidebar.")
         elif compare_mode and not selected_engines:
             st.error("⚠️ Sélectionnez au moins un moteur.")
         else:
@@ -541,31 +599,30 @@ with col_map:
             if results:
                 m = build_map(facilities, results, time_intervals, compare_mode, selected_engines)
                 with map_ph:
-                    st_folium(m, width=None, height=560, returned_objects=[])
+                    st_folium(m, width=None, height=580, returned_objects=[])
 
-                st.markdown("### 📊 Résultats")
-                rows = []
-                for r in results:
-                    aire = compute_area_safe(r["geometry"], r["lon"], r["lat"])
-                    rows.append({
-                        "Structure":   r["name"],
-                        "Temps (min)": r["minutes"],
-                        "Aire (km²)":  aire if aire is not None else "N/D",
-                        "Moteur":      r["engine"],
-                        "Mode":        mode_label
-                    })
-                df = pd.DataFrame(rows)
-                st.dataframe(df, use_container_width=True)
+                df = build_stats_section(results, facilities, time_intervals)
 
+                # Export
+                st.markdown("### ⬇️ Export")
                 gdf_out = gpd.GeoDataFrame(
-                    df.copy(),
+                    [{
+                        "structure":  r["name"],
+                        "lon":        round(r["lon"], 6),
+                        "lat":        round(r["lat"], 6),
+                        "temps_min":  r["minutes"],
+                        "aire_km2":   r.get("aire_km2"),
+                        "moteur":     r["engine"],
+                        "mode":       mode_label,
+                        "algorithme": iso_method,
+                    } for r in results],
                     geometry=[r["geometry"] for r in results],
                     crs=4326
                 )
                 col_dl1, col_dl2 = st.columns(2)
                 with col_dl1:
                     st.download_button(
-                        "⬇️ Télécharger GeoJSON",
+                        "⬇️ GeoJSON",
                         data=gdf_out.to_json(),
                         file_name="isochrones.geojson",
                         mime="application/json"
@@ -574,7 +631,7 @@ with col_map:
                     try:
                         shp_bytes = export_shapefile(gdf_out)
                         st.download_button(
-                            "⬇️ Télécharger Shapefile (.zip)",
+                            "⬇️ Shapefile (.zip)",
                             data=shp_bytes,
                             file_name="isochrones_shp.zip",
                             mime="application/zip"
@@ -587,7 +644,7 @@ with col_map:
 st.divider()
 st.markdown(
     '<div style="text-align:center;font-size:0.78rem;color:#7a7974;">'
-    'Isochrones · OSMnx · ORS · OSRM · Valhalla · GraphHopper · © OpenStreetMap contributors'
+    'Isochrones · OSM Pur (Tps_min) · OSMnx · ORS · OSRM · Valhalla · GraphHopper · © OpenStreetMap contributors'
     '</div>',
     unsafe_allow_html=True
 )
