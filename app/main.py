@@ -1,691 +1,396 @@
+import streamlit as st
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import networkx as nx
+import osmnx as ox
+import requests
+import json
+import time
+import folium
+from streamlit_folium import st_folium
+from shapely.geometry import Point, shape
+from shapely.ops import unary_union
+import alphashape
 import warnings
 warnings.filterwarnings("ignore")
 
-import io
-import json
-import zipfile
-import tempfile
-import os
-
-import numpy as np
-import pandas as pd
-import geopandas as gpd
-import networkx as nx
-import folium
-import streamlit as st
-import osmnx as ox
-import pydeck as pdk
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-
-from shapely.geometry import Point, MultiPolygon
-from streamlit_folium import st_folium
-
-from utils import (
-    PALETTE, MODE_COLORS, MODE_INTERVALS, MODE_SPEEDS,
-    plug_shape_holes, get_gdf_corners,
-    build_graph_from_roads, compute_accessible_subgraph,
-    find_nearest_node, graph_to_gdfs_custom,
-    isochrone_convex, isochrone_offset, isochrone_concave,
-    prepare_interpolation_points, grid_interpolate,
-    colorize_image, convert_image_to_bytes_url,
-    prepare_facility_layer, prepare_roads_layer, prepare_isochrone_layer,
-    gdf_to_geojson_bytes, compute_zone_stats, add_color_to_df
-)
-
-# ── Config page ───────────────────────────────────────────────────────────────
 st.set_page_config(
+    page_title="Isochrones — Zones de Desserte",
+    page_icon="🗺️",
     layout="wide",
-    page_title="Zones de Desserte — Santé",
-    page_icon="🏥",
+    initial_sidebar_state="expanded"
 )
 
 st.markdown("""
 <style>
-[data-testid="stSidebar"] { min-width: 340px; max-width: 400px; }
-.block-container { padding-top: 1rem; }
-.metric-box {
-    background: #f3f0ec; border-radius: 8px;
-    padding: 10px 16px; margin-bottom: 8px;
+@import url('https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&display=swap');
+html, body, [class*="css"] { font-family: 'Satoshi', sans-serif; }
+.stApp { background: #f7f6f2; }
+.main-header {
+  background: #01696f; color: white;
+  padding: 1.2rem 1.5rem; border-radius: 0.75rem; margin-bottom: 1.5rem;
 }
+.main-header h1 { margin: 0; font-size: 1.35rem; font-weight: 700; }
+.main-header p  { margin: 0.2rem 0 0; font-size: 0.83rem; opacity: 0.85; }
+.engine-card {
+  background: white; border: 1px solid rgba(0,0,0,0.08);
+  border-radius: 0.7rem; padding: 0.8rem 1rem; margin-bottom: 0.5rem;
+}
+.engine-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 999px;
+  font-size: 0.7rem; font-weight: 600; margin-left: 6px;
+}
+.badge-api   { background: #cedcd8; color: #01696f; }
+.badge-local { background: #d4dfcc; color: #437a22; }
+.badge-free  { background: #c6d8e4; color: #006494; }
+.info-box {
+  background: #f3f0ec; border-left: 3px solid #01696f;
+  border-radius: 0 0.5rem 0.5rem 0; padding: 0.7rem 1rem;
+  font-size: 0.83rem; color: #28251d; margin-bottom: 1rem;
+}
+div[data-testid="stSidebar"] { background: #f9f8f5; border-right: 1px solid #dcd9d5; }
+div[data-testid="stButton"] button {
+  background: #01696f !important; color: white !important;
+  border: none !important; border-radius: 0.5rem !important;
+  font-weight: 600 !important; width: 100%;
+}
+div[data-testid="stButton"] button:hover { background: #0c4e54 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-colormap = plt.cm.YlOrRd
+st.markdown("""
+<div class="main-header">
+  <h1>🗺️ Générateur d'Isochrones — Zones de Desserte</h1>
+  <p>Multi-moteurs : OSM local · OpenRouteService · OSRM · Valhalla — Structures sanitaires</p>
+</div>
+""", unsafe_allow_html=True)
 
-# ── Session state ─────────────────────────────────────────────────────────────
-defaults = {
-    'roads_gdf': None,
-    'facilities_gdf': None,
-    'results': [],      # liste de dicts {name, mode, time_min, geometry}
-    'stats': [],
-    'graph': None,
-    'graph_utm_crs': None,
-    'use_local_roads': True,
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-# ── Helpers chargement ────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def load_gdf_from_upload(file_bytes, filename):
-    suffix = filename.split('.')[-1].lower()
-    with tempfile.NamedTemporaryFile(suffix=f'.{suffix}', delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-    try:
-        if suffix in ('geojson', 'json'):
-            gdf = gpd.read_file(tmp_path)
-        elif suffix in ('shp',):
-            gdf = gpd.read_file(tmp_path)
-        elif suffix in ('gpkg',):
-            gdf = gpd.read_file(tmp_path)
-        elif suffix in ('zip',):
-            with zipfile.ZipFile(tmp_path) as z:
-                z.extractall(tempfile.gettempdir())
-                shp_files = [f for f in z.namelist() if f.endswith('.shp')]
-                if shp_files:
-                    gdf = gpd.read_file(os.path.join(tempfile.gettempdir(), shp_files[0]))
-                else:
-                    raise ValueError("Aucun .shp trouvé dans le ZIP")
-        else:
-            raise ValueError(f"Format non supporté: {suffix}")
-        if gdf.crs is None:
-            gdf = gdf.set_crs('epsg:4326')
-        else:
-            gdf = gdf.to_crs('epsg:4326')
-        return gdf
-    finally:
-        os.unlink(tmp_path)
-
-
-@st.cache_data(show_spinner=False)
-def load_facilities_from_csv(file_bytes, lon_col, lat_col, name_col):
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    geometry = [Point(row[lon_col], row[lat_col]) for _, row in df.iterrows()]
-    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='epsg:4326')
-    return gdf
-
-
-@st.cache_data(show_spinner=False)
-def download_osm_network(lat, lon, dist, network_type):
-    return ox.graph_from_point((lat, lon), dist=dist, network_type=network_type)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── SIDEBAR ──────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("""
-    <div style='text-align:center; padding: 8px 0 4px 0;'>
-        <svg width='36' height='36' viewBox='0 0 36 36' fill='none' xmlns='http://www.w3.org/2000/svg'>
-          <circle cx='18' cy='18' r='18' fill='#01696f'/>
-          <path d='M18 8v20M8 18h20' stroke='white' stroke-width='3.5' stroke-linecap='round'/>
-          <circle cx='18' cy='18' r='6' stroke='white' stroke-width='2'/>
-        </svg>
-        <div style='font-size:17px; font-weight:700; color:#01696f; margin-top:4px;'>Zones de Desserte</div>
-        <div style='font-size:12px; color:#7a7974;'>Établissements de Santé</div>
-    </div>
-    <hr style='border-color:#dcd9d5; margin: 8px 0;'/>
-    """, unsafe_allow_html=True)
+    st.markdown("### ⚙️ Configuration")
 
-    # ── 1. DONNÉES ROUTES ───────────────────────────────────────────────────
-    st.markdown("### 📁 1. Données Routes")
-    data_source = st.radio(
-        "Source des routes",
-        ["Charger fichier local (OSM)", "Télécharger depuis OSM (en ligne)"],
-        help="Utilisez vos routes locales avec Tps_min, Vit_kmh, maxspeed, osm_id"
-    )
+    # Moteur
+    st.markdown("#### 🔌 Moteur de Routing")
+    engine = st.selectbox("Choisir le moteur", [
+        "OSM local (OSMnx + NetworkX) — Gratuit",
+        "OpenRouteService (ORS) — Clé API",
+        "OSRM Public — Gratuit",
+        "Valhalla Public — Gratuit",
+    ])
 
-    if data_source == "Charger fichier local (OSM)":
-        road_file = st.file_uploader(
-            "Routes OSM (GeoJSON, Shapefile ZIP, GPKG)",
-            type=['geojson', 'json', 'zip', 'gpkg'],
-            help="Couche avec colonnes: osm_id, Tps_min, Vit_kmh, maxspeed"
-        )
-        if road_file:
-            with st.spinner("Chargement des routes..."):
-                try:
-                    gdf = load_gdf_from_upload(road_file.read(), road_file.name)
-                    st.session_state.roads_gdf = gdf
-                    st.session_state.use_local_roads = True
-                    # Afficher colonnes détectées
-                    cols = list(gdf.columns)
-                    detected = [c for c in ['osm_id','Tps_min','Vit_kmh','maxspeed'] if c in cols]
-                    st.success(f"✅ {len(gdf)} tronçons chargés")
-                    if detected:
-                        st.info(f"Colonnes détectées : {', '.join(detected)}")
-                    else:
-                        st.warning("⚠️ Colonnes Tps_min/Vit_kmh non trouvées. Vitesse par défaut utilisée.")
-                except Exception as e:
-                    st.error(f"Erreur chargement : {e}")
-    else:
-        st.session_state.use_local_roads = False
-        st.info("Les routes seront téléchargées automatiquement via OSMnx lors du calcul.")
+    engine_info = {
+        "OSM local (OSMnx + NetworkX) — Gratuit": ("badge-local","LOCAL",
+            "Calcul 100% local avec routes OSM. Colonnes utilisées : Tps_min, Vit_kmh, maxspeed."),
+        "OpenRouteService (ORS) — Clé API": ("badge-api","API",
+            "Très précis. Clé gratuite sur openrouteservice.org → ajoutez ORS_API_KEY dans les secrets Streamlit."),
+        "OSRM Public — Gratuit": ("badge-free","GRATUIT",
+            "router.project-osrm.org — sans clé. Isochrones approximatifs par matrice de durées."),
+        "Valhalla Public — Gratuit": ("badge-free","GRATUIT",
+            "valhalla.openstreetmap.de — Isochrones polygonaux natifs, 4 modes, sans clé."),
+    }
+    bc, bl, bi = engine_info[engine]
+    st.markdown(f'<div class="info-box"><span class="engine-badge {bc}">{bl}</span> {bi}</div>',
+                unsafe_allow_html=True)
 
-    st.divider()
-
-    # ── 2. ÉTABLISSEMENTS DE SANTÉ ──────────────────────────────────────────
-    st.markdown("### 🏥 2. Établissements de Santé")
-    fac_source = st.radio(
-        "Source des établissements",
-        ["Charger fichier", "Saisir manuellement"],
-    )
-
-    if fac_source == "Charger fichier":
-        fac_file = st.file_uploader(
-            "Établissements (GeoJSON, Shapefile ZIP, GPKG, CSV)",
-            type=['geojson', 'json', 'zip', 'gpkg', 'csv'],
-            key="fac_upload"
-        )
-        if fac_file:
-            with st.spinner("Chargement des établissements..."):
-                try:
-                    if fac_file.name.endswith('.csv'):
-                        df_tmp = pd.read_csv(fac_file)
-                        st.write("Colonnes CSV :", list(df_tmp.columns))
-                        lon_col = st.selectbox("Colonne Longitude", df_tmp.columns)
-                        lat_col = st.selectbox("Colonne Latitude", df_tmp.columns)
-                        name_col = st.selectbox("Colonne Nom", df_tmp.columns)
-                        fac_file.seek(0)
-                        gdf_fac = load_facilities_from_csv(fac_file.read(), lon_col, lat_col, name_col)
-                    else:
-                        gdf_fac = load_gdf_from_upload(fac_file.read(), fac_file.name)
-                    st.session_state.facilities_gdf = gdf_fac
-                    st.success(f"✅ {len(gdf_fac)} établissements chargés")
-                except Exception as e:
-                    st.error(f"Erreur : {e}")
-    else:
-        with st.form("manual_facility"):
-            fac_name = st.text_input("Nom de l'établissement", value="Centre de Santé")
-            fac_lat  = st.number_input("Latitude",  value=12.3700, format="%.6f")
-            fac_lon  = st.number_input("Longitude", value=-1.5200, format="%.6f")
-            fac_type = st.selectbox("Type", ["Hôpital", "Centre de Santé", "CSPS", "Dispensaire", "Maternité", "Autre"])
-            add_btn = st.form_submit_button("➕ Ajouter")
-            if add_btn:
-                new_row = gpd.GeoDataFrame(
-                    [{'nom': fac_name, 'type': fac_type, 'geometry': Point(fac_lon, fac_lat)}],
-                    geometry='geometry', crs='epsg:4326'
-                )
-                if st.session_state.facilities_gdf is None:
-                    st.session_state.facilities_gdf = new_row
-                else:
-                    st.session_state.facilities_gdf = pd.concat(
-                        [st.session_state.facilities_gdf, new_row], ignore_index=True
-                    )
-                st.success(f"✅ {fac_name} ajouté")
-
-    if st.session_state.facilities_gdf is not None:
-        st.markdown(f"**{len(st.session_state.facilities_gdf)} établissement(s) chargé(s)**")
-        if st.button("🗑️ Effacer les établissements"):
-            st.session_state.facilities_gdf = None
-            st.rerun()
-
-    st.divider()
-
-    # ── 3. PARAMÈTRES DE CALCUL ─────────────────────────────────────────────
-    st.markdown("### ⚙️ 3. Paramètres")
-
-    modes_selected = st.multiselect(
-        "Modes de transport",
-        options=["Marche", "Vehicule", "Velo"],
-        default=["Marche"],
-        help="Marche: 5km/h | Véhicule: 40km/h | Vélo: 15km/h (si pas de Vit_kmh dans les données)"
-    )
-
-    st.markdown("**Intervalles de temps (minutes)**")
-    time_col1, time_col2 = st.columns(2)
-    custom_times = {}
-    for mode in modes_selected:
-        default_times = MODE_INTERVALS.get(mode, [15, 30, 60])
-        selected_times = st.multiselect(
-            f"{mode}",
-            options=[5, 10, 15, 20, 30, 45, 60, 90, 120],
-            default=[t for t in default_times if t in [5,10,15,20,30,45,60,90,120]],
-            key=f"times_{mode}"
-        )
-        custom_times[mode] = sorted(selected_times) if selected_times else default_times
-
-    st.markdown("**Méthode isochrone**")
-    method = st.selectbox(
-        "Méthode de calcul",
-        ["Offset (Tampon routes)", "Convexe", "Concave", "Interpolation IDW"],
-        help="Offset = tampon autour des routes accessibles (recommandé pour données locales)"
-    )
-
-    with st.expander("Paramètres avancés"):
-        offset_m = st.slider("Tampon offset (m)", 50, 500, 150, 50)
-        padding_m = st.slider("Padding convexe/concave (m)", 10, 200, 50, 10)
-        alpha_pct = st.slider("Alpha concave (%)", 10, 100, 80, 5)
-        plug_holes = st.checkbox("Combler les trous", value=True)
-        osm_dist   = st.slider("Rayon download OSM (m)", 1000, 20000, 5000, 500,
-                               help="Distance de téléchargement si source OSM en ligne")
-
-    st.divider()
-
-    # ── 4. LANCER ───────────────────────────────────────────────────────────
-    run_btn = st.button(
-        "🚀 Calculer les zones de desserte",
-        type="primary",
-        disabled=(st.session_state.facilities_gdf is None),
-        use_container_width=True
-    )
-    if st.session_state.facilities_gdf is None:
-        st.caption("⚠️ Chargez d'abord les établissements de santé.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN — TABS
-# ═══════════════════════════════════════════════════════════════════════════════
-st.markdown("## 🏥 Zones de Desserte — Établissements de Santé")
-st.caption("Isochrones calculées à partir de vos données OSM locales (Tps_min, Vit_kmh, maxspeed, osm_id)")
-
-tab_map, tab_table, tab_export, tab_help = st.tabs([
-    "🗺️ Carte", "📊 Résultats", "💾 Export", "ℹ️ Guide"
-])
-
-# ── CALCUL ────────────────────────────────────────────────────────────────────
-if run_btn and st.session_state.facilities_gdf is not None:
-    st.session_state.results = []
-    st.session_state.stats = []
-
-    facilities = st.session_state.facilities_gdf
-    roads_gdf  = st.session_state.roads_gdf
-    use_local  = st.session_state.use_local_roads and roads_gdf is not None
-
-    # Nom column
-    nom_col = 'nom' if 'nom' in facilities.columns else (
-              'name' if 'name' in facilities.columns else facilities.columns[0])
-
-    progress_bar = st.progress(0, text="Démarrage du calcul...")
-    total_steps = len(facilities) * len(modes_selected)
-    step = 0
-
-    for fac_idx, fac_row in facilities.iterrows():
-        fac_name = str(fac_row.get(nom_col, f"Etab_{fac_idx}"))
-        fac_pt   = fac_row.geometry
-        fac_lon, fac_lat = fac_pt.x, fac_pt.y
-
-        for mode in modes_selected:
-            step += 1
-            pct = int(step / total_steps * 100)
-            progress_bar.progress(pct, text=f"Calcul {fac_name} — {mode} ({step}/{total_steps})")
-
-            try:
-                # Construire le graphe
-                if use_local:
-                    G, utm_crs = build_graph_from_roads(roads_gdf, mode)
-                else:
-                    net_type = {'Marche': 'walk', 'Vehicule': 'drive', 'Velo': 'bike'}[mode]
-                    ox_graph = download_osm_network(fac_lat, fac_lon, osm_dist, net_type)
-                    ox_graph = ox.add_edge_travel_times(ox.add_edge_speeds(ox_graph))
-                    G = ox_graph
-                    utm_crs = None
-
-                # Noeud de départ
-                start_node = find_nearest_node(G, fac_lon, fac_lat)
-                if start_node is None:
-                    st.warning(f"Noeud introuvable pour {fac_name}")
-                    continue
-
-                # Noeuds & arêtes
-                nodes_gdf, edges_gdf = graph_to_gdfs_custom(G)
-
-                times_min = custom_times.get(mode, MODE_INTERVALS[mode])
-                max_time_sec = max(times_min) * 60
-
-                # Sous-graphe accessible
-                subgraph, node_lengths = compute_accessible_subgraph(
-                    G, start_node, max_time_sec, weight='travel_time'
-                )
-
-                if len(subgraph.nodes) == 0:
-                    st.warning(f"Aucun noeud accessible pour {fac_name} — {mode}")
-                    continue
-
-                acc_nodes_gdf, acc_edges_gdf = graph_to_gdfs_custom(subgraph)
-
-                # Isochrone par intervalle de temps
-                for t_min in times_min:
-                    t_sec = t_min * 60
-                    # Filtrer les noeuds accessibles dans ce temps
-                    nodes_in_t = {n: d for n, d in node_lengths.items() if d <= t_sec}
-                    if len(nodes_in_t) < 2:
-                        continue
-
-                    acc_nodes_t = nodes_gdf[nodes_gdf.index.isin(nodes_in_t.keys())].copy()
-                    acc_edges_t = edges_gdf[
-                        edges_gdf['u'].isin(nodes_in_t.keys()) &
-                        edges_gdf['v'].isin(nodes_in_t.keys())
-                    ].copy()
-
-                    # Calculer l'isochrone selon la méthode choisie
-                    try:
-                        if method == "Offset (Tampon routes)":
-                            iso_geom = isochrone_offset(acc_edges_t, offset_m, plug_holes=plug_holes)
-                        elif method == "Convexe":
-                            iso_geom = isochrone_convex(acc_nodes_t, padding_m)
-                        elif method == "Concave":
-                            iso_geom = isochrone_concave(acc_nodes_t, alpha_pct, padding_m)
-                        else:  # IDW
-                            iso_geom = isochrone_convex(acc_nodes_t, padding_m)
-
-                        if iso_geom is None or iso_geom.is_empty:
-                            continue
-
-                        iso_gdf = gpd.GeoDataFrame(
-                            [{'facility': fac_name, 'mode': mode,
-                              'time_min': t_min, 'methode': method,
-                              'geometry': iso_geom}],
-                            geometry='geometry', crs='epsg:4326'
-                        )
-
-                        st.session_state.results.append({
-                            'facility': fac_name, 'mode': mode,
-                            'time_min': t_min, 'gdf': iso_gdf,
-                            'nodes': acc_nodes_t, 'edges': acc_edges_t,
-                        })
-
-                        stats = compute_zone_stats(iso_gdf, fac_name, mode, t_min)
-                        st.session_state.stats.append(stats)
-
-                    except Exception as e:
-                        st.warning(f"Erreur isochrone {fac_name}/{mode}/{t_min}min : {e}")
-
-            except Exception as e:
-                st.error(f"Erreur pour {fac_name} — {mode} : {e}")
-
-    progress_bar.empty()
-    if st.session_state.results:
-        st.success(f"✅ {len(st.session_state.results)} zones calculées avec succès !")
-    else:
-        st.error("Aucune zone calculée. Vérifiez vos données.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — CARTE
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_map:
-    if not st.session_state.results and st.session_state.facilities_gdf is None:
-        st.info("👈 Chargez vos données dans la barre latérale et lancez le calcul.")
-    else:
-        # Carte de base centrée
-        if st.session_state.facilities_gdf is not None:
-            center_pt = st.session_state.facilities_gdf.geometry.unary_union.centroid
-            map_center = [center_pt.y, center_pt.x]
+    # Clé ORS
+    ors_key = ""
+    if "ORS" in engine:
+        ors_key = st.secrets.get("ORS_API_KEY", "")
+        if ors_key:
+            st.success("✅ Clé ORS chargée depuis Streamlit Secrets")
         else:
-            map_center = [12.37, -1.52]
+            ors_key = st.text_input("Clé API ORS", type="password",
+                                     help="Obtenez une clé gratuite sur openrouteservice.org")
 
-        col_map, col_legend = st.columns([5, 1])
+    st.divider()
 
-        with col_map:
-            if st.session_state.results:
-                # Préparer les couches PyDeck
-                layers = []
+    # Mode de transport
+    st.markdown("#### 🚶 Mode de Transport")
+    MODES = {
+        "OSM local (OSMnx + NetworkX) — Gratuit": {
+            "🚶 Marche": ("walk","walk"), "🚗 Véhicule": ("drive","drive"), "🚲 Vélo": ("bike","bike")},
+        "OpenRouteService (ORS) — Clé API": {
+            "🚶 Marche": ("foot-walking","walk"), "🚗 Voiture": ("driving-car","drive"),
+            "🚲 Vélo": ("cycling-regular","bike"), "🛵 HGV": ("driving-hgv","drive")},
+        "OSRM Public — Gratuit": {
+            "🚗 Voiture": ("car","drive"), "🚲 Vélo": ("bike","bike"), "🚶 Marche": ("foot","walk")},
+        "Valhalla Public — Gratuit": {
+            "🚶 Marche": ("pedestrian","walk"), "🚗 Voiture": ("auto","drive"),
+            "🚲 Vélo": ("bicycle","bike"), "🛵 Moto": ("motorcycle","drive")},
+    }
+    mode_label = st.selectbox("Mode", list(MODES[engine].keys()))
+    mode_api, mode_osm = MODES[engine][mode_label]
 
-                # Routes locales
-                if st.session_state.roads_gdf is not None:
-                    layers.append(prepare_roads_layer(st.session_state.roads_gdf))
+    st.divider()
 
-                # Isochrones — par temps décroissant (les plus grandes en dessous)
-                results_sorted = sorted(st.session_state.results,
-                                        key=lambda r: r['time_min'], reverse=True)
+    # Intervalles
+    st.markdown("#### ⏱️ Intervalles (minutes)")
+    c1, c2 = st.columns(2)
+    with c1:
+        t1 = st.number_input("Seuil 1", value=15, min_value=5, max_value=180, step=5)
+        t3 = st.number_input("Seuil 3", value=45, min_value=5, max_value=180, step=5)
+    with c2:
+        t2 = st.number_input("Seuil 2", value=30, min_value=5, max_value=180, step=5)
+        t4 = st.number_input("Seuil 4", value=60, min_value=5, max_value=180, step=5)
+    time_intervals = sorted({t for t in [t1, t2, t3, t4] if t > 0})
 
-                # Filtre interactif
-                all_modes = list(set(r['mode'] for r in st.session_state.results))
-                all_times = sorted(set(r['time_min'] for r in st.session_state.results))
+    st.divider()
 
-                filter_col1, filter_col2 = st.columns(2)
-                with filter_col1:
-                    filter_modes = st.multiselect("Filtrer par mode", all_modes, default=all_modes, key="filt_mode")
-                with filter_col2:
-                    filter_times = st.multiselect("Filtrer par temps (min)", all_times, default=all_times, key="filt_time")
+    # Structures
+    st.markdown("#### 📍 Structures Sanitaires")
+    input_mode = st.radio("Source", [
+        "Fichier GeoJSON/Shapefile", "Saisie manuelle", "Exemple (Ouagadougou)"], index=2)
 
-                for r in results_sorted:
-                    if r['mode'] not in filter_modes:
-                        continue
-                    if r['time_min'] not in filter_times:
-                        continue
-
-                    base_color = MODE_COLORS.get(r['mode'], [100, 100, 200, 120])
-                    # Opacité croissante avec le temps
-                    max_t = max(all_times) if all_times else 60
-                    opacity = int(40 + (r['time_min'] / max_t) * 120)
-                    color = base_color[:3] + [opacity]
-
-                    layers.append(prepare_isochrone_layer(r['gdf'], color))
-
-                # Établissements
-                if st.session_state.facilities_gdf is not None:
-                    layers.append(prepare_facility_layer(st.session_state.facilities_gdf))
-
-                viewport = pdk.ViewState(
-                    latitude=map_center[0], longitude=map_center[1],
-                    zoom=10, pitch=0
-                )
-
-                st.pydeck_chart(pdk.Deck(
-                    initial_view_state=viewport,
-                    layers=layers,
-                    tooltip={
-                        "html": "<b>{facility}</b><br/>Mode: {mode}<br/>Temps: {time_min} min",
-                        "style": {"backgroundColor": "#01696f", "color": "white", "fontSize": "13px"}
-                    },
-                    map_style="mapbox://styles/mapbox/light-v11",
-                ))
-
-            else:
-                # Carte simple folium avant calcul
-                m = folium.Map(location=map_center, zoom_start=10, tiles="CartoDB positron")
-                if st.session_state.facilities_gdf is not None:
-                    for _, row in st.session_state.facilities_gdf.iterrows():
-                        folium.Marker(
-                            location=[row.geometry.y, row.geometry.x],
-                            tooltip=str(row.get('nom', row.get('name', 'Établissement'))),
-                            icon=folium.Icon(color='red', icon='plus-sign')
-                        ).add_to(m)
-                if st.session_state.roads_gdf is not None:
-                    folium.GeoJson(
-                        st.session_state.roads_gdf.__geo_interface__,
-                        style_function=lambda x: {'color': '#aaa', 'weight': 1, 'opacity': 0.5}
-                    ).add_to(m)
-                st_folium(m, use_container_width=True, height=520)
-
-        with col_legend:
-            st.markdown("**Légende**")
-            for mode, color in MODE_COLORS.items():
-                if mode in (filter_modes if st.session_state.results else []):
-                    c = f"rgba({color[0]},{color[1]},{color[2]},0.8)"
-                    icon = {'Marche': '🚶', 'Vehicule': '🚗', 'Velo': '🚲'}[mode]
-                    st.markdown(
-                        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">' +
-                        f'<div style="width:18px;height:18px;background:{c};border-radius:3px;"></div>' +
-                        f'<span>{icon} {mode}</span></div>',
-                        unsafe_allow_html=True
-                    )
-            st.markdown("---")
-            st.markdown("🟡 Établissements")
-            if st.session_state.results:
-                all_times_sorted = sorted(set(r['time_min'] for r in st.session_state.results))
-                st.markdown("**Intervalles :**")
-                for t in all_times_sorted:
-                    st.markdown(f"• {t} min")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — RÉSULTATS
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_table:
-    if st.session_state.stats:
-        df_stats = pd.DataFrame(st.session_state.stats)
-        st.markdown(f"### {len(df_stats)} zones calculées")
-
-        # KPIs
-        k1, k2, k3, k4 = st.columns(4)
-        with k1:
-            st.metric("Zones totales", len(df_stats))
-        with k2:
-            st.metric("Établissements", df_stats['Établissement'].nunique())
-        with k3:
-            st.metric("Modes", df_stats['Mode'].nunique())
-        with k4:
-            avg_area = df_stats['Superficie (km²)'].mean()
-            st.metric("Superficie moy.", f"{avg_area:.2f} km²" if avg_area else "—")
-
-        st.dataframe(
-            df_stats.sort_values(['Établissement', 'Mode', 'Temps (min)']),
-            use_container_width=True, hide_index=True
-        )
-
-        # Graphique surfaces
-        if df_stats['Superficie (km²)'].notna().any():
-            st.markdown("### Superficie des zones par établissement et mode")
-            fig, ax = plt.subplots(figsize=(10, 4))
-            pivot = df_stats.pivot_table(
-                index='Temps (min)', columns=['Établissement', 'Mode'],
-                values='Superficie (km²)', aggfunc='mean'
-            )
-            pivot.plot(ax=ax, marker='o')
-            ax.set_xlabel("Temps (min)")
-            ax.set_ylabel("Superficie (km²)")
-            ax.set_title("Évolution de la superficie selon le temps de desserte")
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc='upper left', fontsize=8)
-            st.pyplot(fig)
-            plt.close()
+    facilities = []
+    if input_mode == "Fichier GeoJSON/Shapefile":
+        up = st.file_uploader("Charger", type=["geojson","json","shp","gpkg"])
+        if up:
+            try:
+                gdf = gpd.read_file(up).to_crs(4326)
+                for i, row in gdf.iterrows():
+                    if row.geometry and row.geometry.geom_type == "Point":
+                        nm = row.get("nom", row.get("name", f"Structure {i}"))
+                        facilities.append({"id": i, "name": nm,
+                                           "lon": row.geometry.x, "lat": row.geometry.y})
+                st.success(f"✅ {len(facilities)} structures")
+            except Exception as e:
+                st.error(str(e))
+    elif input_mode == "Saisie manuelle":
+        raw = st.text_area("nom, lon, lat (une par ligne)",
+                           "CS Bogodogo, -1.5312, 12.3345\nHôpital Yalgado, -1.5167, 12.3611",
+                           height=100)
+        for i, line in enumerate(raw.strip().split("\n")):
+            p = line.split(",")
+            if len(p) == 3:
+                try:
+                    facilities.append({"id": i, "name": p[0].strip(),
+                                       "lon": float(p[1]), "lat": float(p[2])})
+                except: pass
+        if facilities: st.success(f"✅ {len(facilities)} structures")
     else:
-        st.info("Lancez le calcul pour voir les résultats ici.")
+        facilities = [
+            {"id": 1, "name": "CS Bogodogo",     "lon": -1.5312, "lat": 12.3345},
+            {"id": 2, "name": "CS Baskuy",       "lon": -1.5600, "lat": 12.3700},
+            {"id": 3, "name": "Hôpital Yalgado", "lon": -1.5167, "lat": 12.3611},
+        ]
+        st.info("3 structures exemples (Ouagadougou)")
+
+    st.divider()
+
+    # Méthode géométrique (OSM local)
+    iso_method, alpha_val = "Alpha Shape (recommandé)", 0.4
+    if "OSM local" in engine:
+        st.markdown("#### 🔧 Méthode Géométrique")
+        iso_method = st.selectbox("Algorithme", [
+            "Alpha Shape (recommandé)", "Convex Hull", "Buffer sur noeuds"])
+        if iso_method == "Alpha Shape (recommandé)":
+            alpha_val = st.slider("Paramètre alpha", 0.1, 1.0, 0.4, 0.05)
+
+    st.divider()
+    run_btn = st.button("🚀 Calculer les Isochrones", use_container_width=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — EXPORT
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_export:
-    if st.session_state.results:
-        st.markdown("### 💾 Exporter les zones de desserte")
-
-        export_col1, export_col2 = st.columns(2)
-
-        with export_col1:
-            # Export GeoJSON global
-            all_gdfs = [r['gdf'] for r in st.session_state.results]
-            merged = pd.concat(all_gdfs, ignore_index=True)
-            merged_gdf = gpd.GeoDataFrame(merged, geometry='geometry', crs='epsg:4326')
-
-            geojson_bytes = gdf_to_geojson_bytes(merged_gdf)
-            st.download_button(
-                label="⬇️ Télécharger GeoJSON (toutes les zones)",
-                data=geojson_bytes,
-                file_name="zones_desserte_sante.geojson",
-                mime="application/json",
-                use_container_width=True
-            )
-
-        with export_col2:
-            # Export CSV stats
-            if st.session_state.stats:
-                df_export = pd.DataFrame(st.session_state.stats)
-                csv_bytes = df_export.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="⬇️ Télécharger CSV (statistiques)",
-                    data=csv_bytes,
-                    file_name="stats_zones_desserte.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-
-        st.markdown("---")
-        # Export par mode
-        st.markdown("#### Export par mode de transport")
-        for mode in set(r['mode'] for r in st.session_state.results):
-            mode_gdfs = [r['gdf'] for r in st.session_state.results if r['mode'] == mode]
-            mode_merged = gpd.GeoDataFrame(
-                pd.concat(mode_gdfs, ignore_index=True),
-                geometry='geometry', crs='epsg:4326'
-            )
-            geojson_mode = gdf_to_geojson_bytes(mode_merged)
-            icon = {'Marche': '🚶', 'Vehicule': '🚗', 'Velo': '🚲'}.get(mode, '📍')
-            st.download_button(
-                label=f"{icon} GeoJSON — {mode}",
-                data=geojson_mode,
-                file_name=f"zones_desserte_{mode.lower()}.geojson",
-                mime="application/json",
-            )
-    else:
-        st.info("Lancez le calcul pour pouvoir exporter les résultats.")
+# ── FONCTIONS ────────────────────────────────────────────────────
+COLORS   = ["#27ae60", "#f39c12", "#e74c3c", "#8e44ad"]
+OPACITIES = [0.22, 0.19, 0.16, 0.13]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — GUIDE
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_help:
+def isochrone_osmnx(lon, lat, minutes, mode, method, alpha):
+    from utils import compute_osmnx_isochrone
+    return compute_osmnx_isochrone(lon, lat, minutes, mode, method, alpha)
+
+
+def isochrone_ors(lon, lat, minutes, profile, key):
+    url = f"https://api.openrouteservice.org/v2/isochrones/{profile}"
+    resp = requests.post(url, json={
+        "locations": [[lon, lat]], "range": [minutes*60],
+        "smoothing": 5, "attributes": ["area"]
+    }, headers={"Authorization": key, "Content-Type": "application/json"}, timeout=15)
+    if resp.status_code == 200:
+        data = resp.json()
+        if "features" in data and data["features"]:
+            return shape(data["features"][0]["geometry"])
+    raise Exception(f"ORS {resp.status_code}: {resp.text[:200]}")
+
+
+def isochrone_osrm(lon, lat, minutes, profile):
+    speeds = {"foot": 4.5, "bike": 15.0, "car": 50.0}
+    spd = speeds.get(profile, 50.0)
+    R = (minutes / 60) * spd * 1000
+    angles = np.linspace(0, 2*np.pi, 36, endpoint=False)
+    Re = 6371000
+    dlats = [np.degrees(R/Re * np.cos(a)) for a in angles]
+    dlons = [np.degrees(R/Re * np.sin(a) / np.cos(np.radians(lat))) for a in angles]
+    dests = [(lon+dlons[i], lat+dlats[i]) for i in range(36)]
+    coords_str = f"{lon},{lat};" + ";".join([f"{d[0]},{d[1]}" for d in dests])
+    url = (f"http://router.project-osrm.org/table/v1/{profile}/{coords_str}"
+           f"?sources=0&destinations={';'.join(str(i+1) for i in range(36))}&annotations=duration")
+    resp = requests.get(url, timeout=20)
+    if resp.status_code != 200:
+        raise Exception(f"OSRM {resp.status_code}")
+    durations = resp.json()["durations"][0]
+    target = minutes * 60
+    pts = []
+    for i, dur in enumerate(durations):
+        if dur is None: dur = target * 2
+        ratio = min(1.0, target / dur) if dur > 0 else 1.0
+        pts.append(Point(lon + dlons[i]*ratio, lat + dlats[i]*ratio))
+    return unary_union(pts).convex_hull if pts else Point(lon, lat).buffer(0.01)
+
+
+def isochrone_valhalla(lon, lat, minutes, costing):
+    url = "https://valhalla1.openstreetmap.de/isochrone"
+    body = {
+        "locations": [{"lon": lon, "lat": lat}],
+        "costing": costing,
+        "contours": [{"time": minutes, "color": "ff0000"}],
+        "polygons": True, "generalize": 50
+    }
+    resp = requests.get(url, params={"json": json.dumps(body)}, timeout=30)
+    if resp.status_code == 200:
+        data = resp.json()
+        if "features" in data and data["features"]:
+            return shape(data["features"][0]["geometry"])
+    raise Exception(f"Valhalla {resp.status_code}: {resp.text[:200]}")
+
+
+def compute_all(facilities, time_intervals, engine, mode_api, mode_osm,
+                iso_method, alpha_val, ors_key):
+    results = []
+    prog = st.progress(0)
+    stat = st.empty()
+    total = len(facilities) * len(time_intervals)
+    done = 0
+    for fac in facilities:
+        for mins in time_intervals:
+            stat.markdown(f"⏳ **{fac['name']}** — {mins} min…")
+            try:
+                if "OSM local" in engine:
+                    poly = isochrone_osmnx(fac["lon"], fac["lat"], mins, mode_osm, iso_method, alpha_val)
+                elif "ORS" in engine:
+                    if not ors_key: st.error("Clé ORS manquante !"); return []
+                    poly = isochrone_ors(fac["lon"], fac["lat"], mins, mode_api, ors_key)
+                    time.sleep(1.5)
+                elif "OSRM" in engine:
+                    poly = isochrone_osrm(fac["lon"], fac["lat"], mins, mode_api)
+                    time.sleep(0.5)
+                elif "Valhalla" in engine:
+                    poly = isochrone_valhalla(fac["lon"], fac["lat"], mins, mode_api)
+                    time.sleep(0.5)
+                else: poly = None
+                if poly and not poly.is_empty:
+                    results.append({**fac, "minutes": mins, "geometry": poly})
+            except Exception as e:
+                st.warning(f"⚠️ {fac['name']} {mins} min : {e}")
+            done += 1
+            prog.progress(done / total)
+    prog.empty(); stat.empty()
+    return results
+
+
+def build_map(facilities, results, time_intervals):
+    clat = np.mean([f["lat"] for f in facilities]) if facilities else 12.36
+    clon = np.mean([f["lon"] for f in facilities]) if facilities else -1.53
+    m = folium.Map(location=[clat, clon], zoom_start=11, tiles="CartoDB positron")
+
+    for i, mins in enumerate(sorted(time_intervals, reverse=True)):
+        color = COLORS[i % len(COLORS)]
+        layer = folium.FeatureGroup(name=f"⏱ {mins} min", show=True)
+        for r in [x for x in results if x["minutes"] == mins]:
+            folium.GeoJson(r["geometry"].__geo_interface__,
+                style_function=lambda x, c=color, o=OPACITIES[i % len(OPACITIES)]: {
+                    "fillColor": c, "fillOpacity": o, "color": c, "weight": 1.5, "opacity": 0.75},
+                tooltip=f"{r['name']} — {mins} min"
+            ).add_to(layer)
+        layer.add_to(m)
+
+    markers = folium.FeatureGroup(name="🏥 Structures", show=True)
+    for fac in facilities:
+        folium.Marker([fac["lat"], fac["lon"]],
+            popup=folium.Popup(f"<b>{fac['name']}</b>", max_width=200),
+            icon=folium.Icon(color="red", icon="plus", prefix="fa"),
+            tooltip=fac["name"]).add_to(markers)
+    markers.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    legend = '<div style="position:fixed;bottom:30px;left:30px;z-index:9999;background:white;padding:12px 16px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.15);font-size:13px;"><b>Zones de desserte</b><br>'
+    for i, mins in enumerate(sorted(time_intervals)):
+        c = COLORS[i % len(COLORS)]
+        legend += f'<span style="display:inline-block;width:13px;height:13px;background:{c};border-radius:3px;margin-right:6px;vertical-align:middle;"></span>{mins} min<br>'
+    legend += "</div>"
+    m.get_root().html.add_child(folium.Element(legend))
+    return m
+
+
+# ── LAYOUT PRINCIPAL ─────────────────────────────────────────────
+col_map, col_info = st.columns([3, 1])
+
+with col_info:
+    st.markdown("### ℹ️ Moteurs")
     st.markdown("""
-    ## 📖 Guide d'utilisation
+<div class="engine-card">
+  <b>OSM local</b> <span class="engine-badge badge-local">LOCAL</span><br>
+  <small>OSMnx + NetworkX. 100% local. Colonnes : <code>Tps_min</code>, <code>Vit_kmh</code>, <code>maxspeed</code>.</small>
+</div>
+<div class="engine-card">
+  <b>OpenRouteService</b> <span class="engine-badge badge-api">API</span><br>
+  <small>Clé gratuite. 500 req/jour. Isochrones très précis, 3 modes.</small>
+</div>
+<div class="engine-card">
+  <b>OSRM Public</b> <span class="engine-badge badge-free">GRATUIT</span><br>
+  <small>Sans clé. Approximatif (matrice de durées). Données OSM mondiales.</small>
+</div>
+<div class="engine-card">
+  <b>Valhalla</b> <span class="engine-badge badge-free">GRATUIT</span><br>
+  <small>Sans clé. Polygones natifs précis. 4 modes de transport.</small>
+</div>
+""", unsafe_allow_html=True)
 
-    Cette application génère des **zones de desserte (isochrones)** autour des établissements
-    de santé en utilisant votre réseau routier OSM local.
+    st.markdown("### 📋 Clé ORS")
+    st.markdown("""
+<div class="info-box">
+  Ajoutez votre clé dans <b>Streamlit Secrets</b> :<br><br>
+  <code>ORS_API_KEY = "5b3ce35..."</code><br><br>
+  → Settings → Secrets dans Streamlit Cloud.
+</div>
+""", unsafe_allow_html=True)
 
-    ---
+with col_map:
+    map_ph = st.empty()
+    if not run_btn:
+        init_m = build_map(facilities, [], time_intervals)
+        with map_ph: st_folium(init_m, width=None, height=560, returned_objects=[])
+    else:
+        if not facilities:
+            st.error("⚠️ Aucune structure définie.")
+        else:
+            with st.spinner("Calcul en cours…"):
+                results = compute_all(facilities, time_intervals, engine,
+                                      mode_api, mode_osm, iso_method, alpha_val, ors_key)
+            if results:
+                m = build_map(facilities, results, time_intervals)
+                with map_ph: st_folium(m, width=None, height=560, returned_objects=[])
 
-    ### 🗂️ Étape 1 — Charger les routes OSM
+                st.markdown("### 📊 Résultats")
+                rows = []
+                for r in results:
+                    try:
+                        aire = round(gpd.GeoSeries([r["geometry"]], crs=4326).to_crs(32630).area.values[0]/1e6, 2)
+                    except: aire = None
+                    rows.append({"Structure": r["name"], "Temps (min)": r["minutes"],
+                                 "Aire (km²)": aire, "Moteur": engine.split("—")[0].strip(),
+                                 "Mode": mode_label})
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True)
 
-    Chargez votre couche de routes avec les colonnes suivantes :
+                gdf_out = gpd.GeoDataFrame(df.copy(),
+                    geometry=[r["geometry"] for r in results], crs=4326)
+                st.download_button("⬇️ Télécharger GeoJSON", data=gdf_out.to_json(),
+                    file_name="isochrones.geojson", mime="application/json")
+            else:
+                st.warning("Aucun résultat. Vérifiez vos paramètres.")
 
-    | Colonne | Type | Description |
-    |---------|------|-------------|
-    | `osm_id` | Entier | Identifiant OSM de la route |
-    | `Tps_min` | Décimal | Temps de parcours en **minutes** |
-    | `Vit_kmh` | Décimal | Vitesse de circulation en **km/h** |
-    | `maxspeed` | Texte | Vitesse maximale autorisée |
-    | `geometry` | LineString | Géométrie de la route |
-
-    > Si `Tps_min` et `Vit_kmh` sont absents, la vitesse par défaut du mode est utilisée.
-
-    **Formats acceptés :** GeoJSON, Shapefile (ZIP), GeoPackage
-
-    ---
-
-    ### 🏥 Étape 2 — Charger les établissements
-
-    Chargez votre couche de points de santé (Hôpitaux, CSPS, Centres de Santé...).
-    Vous pouvez aussi **saisir manuellement** les coordonnées d'un établissement.
-
-    **Formats acceptés :** GeoJSON, Shapefile (ZIP), GeoPackage, CSV (avec colonnes lat/lon)
-
-    ---
-
-    ### ⚙️ Étape 3 — Configurer le calcul
-
-    - **Mode de transport** : Marche, Véhicule ou Vélo
-    - **Intervalles de temps** : ex. 15, 30, 45, 60 minutes
-    - **Méthode** :
-        - *Offset* : tampon autour des routes accessibles (recommandé)
-        - *Convexe* : enveloppe convexe des noeuds accessibles
-        - *Concave* : forme plus précise (alpha-shape)
-        - *IDW* : interpolation spatiale (raster)
-
-    ---
-
-    ### 🚀 Étape 4 — Lancer & Explorer
-
-    Cliquez **"Calculer les zones de desserte"** puis explorez :
-    - 🗺️ **Carte** interactive avec filtres par mode et temps
-    - 📊 **Résultats** avec statistiques et graphiques
-    - 💾 **Export** GeoJSON ou CSV
-
-    ---
-
-    ### 🔬 Méthodes de calcul
-
-    L'application utilise **Dijkstra** sur le graphe routier pour trouver tous les
-    noeuds accessibles dans un temps donné, puis construit la zone de desserte
-    par l'une des 4 méthodes disponibles.
-
-    Inspiré de [isochrone-app](https://github.com/adolmajian/isochrone-app)
-    par [Arthur Dolmajian](https://medium.com/@arthur.dolmajian/creating-isochrones-what-is-the-optimal-way-dfc77a2ca13a).
-
-    ---
-    *Application développée pour l'analyse de l'accessibilité aux soins de santé au Burkina Faso.*
-    """
-    )
+st.divider()
+st.markdown('<div style="text-align:center;font-size:0.78rem;color:#7a7974;">Isochrones · OSMnx · ORS · OSRM · Valhalla · © OpenStreetMap contributors</div>',
+            unsafe_allow_html=True)
