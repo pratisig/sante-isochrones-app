@@ -1,6 +1,7 @@
 """
-utils.py — Fonctions utilitaires pour le calcul d'isochrones et d'itinéraires
+utils.py — Fonctions utilitaires pour isochrones ET itinéraires
 Moteurs : OSMnx (local), OSM Pur Tps_min, ORS (API), OSRM (public), Valhalla (public), GraphHopper (API)
+Sources de points : fichier spatial, saisie manuelle, GPS, Nominatim, clic carte
 """
 import os
 import math
@@ -24,6 +25,9 @@ from projection import auto_utm_epsg, auto_utm_epsg_from_gdf, reproject_to_utm, 
 gpd.options.io_engine = "pyogrio"
 
 
+# ─────────────────────────────────────────────────────────────────
+# UTILITAIRE : lecture robuste de fichiers spatiaux
+# ─────────────────────────────────────────────────────────────────
 def read_geodata(source) -> gpd.GeoDataFrame:
     driver_map = {
         ".shp":     "ESRI Shapefile",
@@ -81,6 +85,47 @@ def read_geodata(source) -> gpd.GeoDataFrame:
             os.remove(tmp_path)
 
 
+# ─────────────────────────────────────────────────────────────────
+# NOMINATIM — géocodage libre (sans clé, monde entier)
+# ─────────────────────────────────────────────────────────────────
+def geocode_nominatim(query: str) -> list:
+    """Retourne une liste de dict {name, lon, lat, display_name}."""
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": query, "format": "json", "limit": 6, "addressdetails": 1}
+    try:
+        resp = requests.get(url, params=params,
+                            headers={"User-Agent": "GeoAnalyse-App/2.0"}, timeout=10)
+        resp.raise_for_status()
+        results = resp.json()
+        out = []
+        for r in results:
+            out.append({
+                "name":         r.get("display_name", query)[:80],
+                "lon":          float(r["lon"]),
+                "lat":          float(r["lat"]),
+                "display_name": r.get("display_name", ""),
+            })
+        return out
+    except Exception as e:
+        raise Exception(f"Nominatim : {e}")
+
+
+def reverse_geocode(lon: float, lat: float) -> str:
+    """Nom du lieu à partir des coordonnées."""
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {"lon": lon, "lat": lat, "format": "json"}
+    try:
+        resp = requests.get(url, params=params,
+                            headers={"User-Agent": "GeoAnalyse-App/2.0"}, timeout=8)
+        data = resp.json()
+        return data.get("display_name", f"{lat:.4f}, {lon:.4f}")[:80]
+    except Exception:
+        return f"{lat:.4f}, {lon:.4f}"
+
+
+# ─────────────────────────────────────────────────────────────────
+# UTILITAIRE : nettoyage et validation géométrie
+# ─────────────────────────────────────────────────────────────────
 def clean_geometry(geom):
     if geom is None or geom.is_empty:
         return None
@@ -104,11 +149,9 @@ def build_polygon_from_points(pts: list, method: str, alpha: float):
             pass
         hull = unary_union(pts).convex_hull
         return clean_geometry(hull)
-
     elif method == "Convex Hull":
         hull = unary_union(pts).convex_hull
         return clean_geometry(hull)
-
     elif method == "Buffer sur noeuds":
         if len(coords) > 0:
             from scipy.spatial.distance import cdist
@@ -123,44 +166,19 @@ def build_polygon_from_points(pts: list, method: str, alpha: float):
             buf_deg = 0.001
         merged = unary_union([p.buffer(buf_deg) for p in pts])
         return clean_geometry(merged)
-
     else:
         hull = unary_union(pts).convex_hull
         return clean_geometry(hull)
 
 
-def _extract_linestring_from_geojson(data):
-    routes = data.get("routes", [])
-    if not routes:
-        return None
-    geom = routes[0].get("geometry")
-    if isinstance(geom, dict):
-        return clean_geometry(shape(geom))
-    if isinstance(geom, str):
-        try:
-            import polyline
-            coords = polyline.decode(geom)
-            return LineString([(lon, lat) for lat, lon in coords])
-        except Exception:
-            return None
-    return None
-
-
-def _route_summary(geometry, distance_m=None, duration_s=None, engine=""):
-    return {
-        "geometry": clean_geometry(geometry),
-        "distance_km": round((distance_m or 0) / 1000, 3) if distance_m is not None else None,
-        "duration_min": round((duration_s or 0) / 60, 2) if duration_s is not None else None,
-        "engine": engine,
-    }
-
-
+# ─────────────────────────────────────────────────────────────────
+# ISOCHRONES — Moteur 1 : OSMnx local
+# ─────────────────────────────────────────────────────────────────
 def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
                             mode: str, method: str, alpha: float,
                             gdf_roads=None):
     DEFAULT_SPEEDS = {"walk": 4.5, "bike": 15.0, "drive": 40.0}
     spd = DEFAULT_SPEEDS.get(mode, 4.5)
-
     dist = int((minutes / 60) * spd * 1000 * 1.6) + 600
     dist = max(dist, 1000)
     dist = min(dist, 80000)
@@ -181,7 +199,6 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
             if oid is None:
                 continue
             oid = str(oid)
-
             v = None
             for col in ("Vit_kmh", "vit_kmh", "vitesse_kmh", "speed_kmh"):
                 val = row.get(col)
@@ -202,7 +219,6 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
                         pass
             if v:
                 road_speeds[oid] = v
-
             for col in ("Tps_min", "tps_min", "time_min", "duree_min"):
                 val = row.get(col)
                 if val is not None:
@@ -214,12 +230,11 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
                     except (ValueError, TypeError):
                         pass
 
-    for _, _, d in G.edges(data=True):
+    for u, v_node, d in G.edges(data=True):
         osmid = str(d.get("osmid", ""))
         if osmid in road_times:
             d["travel_time"] = road_times[osmid]
             continue
-
         edge_speed = road_speeds.get(osmid, spd)
         if osmid not in road_speeds:
             ms = d.get("maxspeed")
@@ -230,7 +245,6 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
                     edge_speed = float(str(ms).split()[0])
                 except (ValueError, TypeError):
                     pass
-
         length = d.get("length", 1)
         d["travel_time"] = length / (max(edge_speed, 1) * 1000 / 3600)
 
@@ -244,6 +258,9 @@ def compute_osmnx_isochrone(lon: float, lat: float, minutes: int,
     return build_polygon_from_points(pts, method, alpha)
 
 
+# ─────────────────────────────────────────────────────────────────
+# ISOCHRONES — Moteur 2 : OSM Pur (depuis couche locale)
+# ─────────────────────────────────────────────────────────────────
 def compute_osm_pur_isochrone(lon: float, lat: float, minutes: int,
                               gdf_roads: gpd.GeoDataFrame,
                               method: str, alpha: float):
@@ -253,9 +270,9 @@ def compute_osm_pur_isochrone(lon: float, lat: float, minutes: int,
     if gdf_roads.crs and gdf_roads.crs.to_epsg() != 4326:
         gdf_roads = gdf_roads.to_crs(4326)
 
-    has_tps = "Tps_min" in gdf_roads.columns
-    has_vit = "Vit_kmh" in gdf_roads.columns
-    has_max = "maxspeed" in gdf_roads.columns
+    has_tps   = "Tps_min" in gdf_roads.columns
+    has_vit   = "Vit_kmh" in gdf_roads.columns
+    has_max   = "maxspeed" in gdf_roads.columns
 
     G = nx.Graph()
     node_counter = 0
@@ -274,14 +291,13 @@ def compute_osm_pur_isochrone(lon: float, lat: float, minutes: int,
         geom = row.geometry
         if geom is None or geom.is_empty:
             continue
-
         if geom.geom_type == "LineString":
-            segments = [(geom.coords[i], geom.coords[i + 1]) for i in range(len(geom.coords) - 1)]
+            segments = [(geom.coords[i], geom.coords[i+1]) for i in range(len(geom.coords)-1)]
         elif geom.geom_type == "MultiLineString":
             segments = []
             for part in geom.geoms:
-                for i in range(len(part.coords) - 1):
-                    segments.append((part.coords[i], part.coords[i + 1]))
+                for i in range(len(part.coords)-1):
+                    segments.append((part.coords[i], part.coords[i+1]))
         else:
             continue
 
@@ -314,7 +330,6 @@ def compute_osm_pur_isochrone(lon: float, lat: float, minutes: int,
                         speed = float(str(ms).split()[0])
                     except (ValueError, TypeError):
                         pass
-
             gs = gpd.GeoSeries([geom], crs=4326)
             try:
                 epsg = auto_utm_epsg(lon, lat)
@@ -323,7 +338,8 @@ def compute_osm_pur_isochrone(lon: float, lat: float, minutes: int,
                 length_m = geom.length * 111000
             travel_time_sec = length_m / (max(speed, 1) * 1000 / 3600)
 
-        time_per_seg = travel_time_sec / max(len(segments), 1)
+        n_segs = len(segments)
+        time_per_seg = travel_time_sec / max(n_segs, 1)
 
         for (x1, y1), (x2, y2) in segments:
             u = get_or_create_node(x1, y1)
@@ -339,11 +355,13 @@ def compute_osm_pur_isochrone(lon: float, lat: float, minutes: int,
 
     nodes_xy = np.array([[G.nodes[n]["x"], G.nodes[n]["y"]] for n in G.nodes()])
     node_ids = list(G.nodes())
-    dists = np.sqrt((nodes_xy[:, 0] - lon) ** 2 + (nodes_xy[:, 1] - lat) ** 2)
+    dists = np.sqrt((nodes_xy[:, 0] - lon)**2 + (nodes_xy[:, 1] - lat)**2)
     source = node_ids[np.argmin(dists)]
 
-    lengths = nx.single_source_dijkstra_path_length(G, source, cutoff=minutes * 60, weight="travel_time")
+    target_sec = minutes * 60
+    lengths = nx.single_source_dijkstra_path_length(G, source, cutoff=target_sec, weight="travel_time")
     accessible_nodes = list(lengths.keys())
+
     if len(accessible_nodes) < 4:
         return Point(lon, lat).buffer(0.005)
 
@@ -351,9 +369,12 @@ def compute_osm_pur_isochrone(lon: float, lat: float, minutes: int,
     return build_polygon_from_points(pts, method, alpha)
 
 
+# ─────────────────────────────────────────────────────────────────
+# ISOCHRONES — Moteur 3 : ORS
+# ─────────────────────────────────────────────────────────────────
 def isochrone_ors(lon: float, lat: float, minutes: int, profile: str, key: str):
     if not key or not key.strip():
-        raise Exception("Clé API ORS manquante. Obtenez-en une sur openrouteservice.org")
+        raise Exception("Clé API ORS manquante. openrouteservice.org")
     url = f"https://api.openrouteservice.org/v2/isochrones/{profile}"
     resp = requests.post(url, json={
         "locations": [[lon, lat]],
@@ -369,35 +390,37 @@ def isochrone_ors(lon: float, lat: float, minutes: int, profile: str, key: str):
     raise Exception(f"ORS {resp.status_code}: {resp.text[:300]}")
 
 
+# ─────────────────────────────────────────────────────────────────
+# ISOCHRONES — Moteur 4 : OSRM (72 points)
+# ─────────────────────────────────────────────────────────────────
 def isochrone_osrm(lon: float, lat: float, minutes: int, profile: str):
     speeds = {"foot": 4.5, "bike": 15.0, "car": 50.0}
     spd = speeds.get(profile, 50.0)
-    r_base = (minutes / 60) * spd * 1000
-    re = 6371000.0
-    radii = [r_base * 0.8, r_base * 1.2]
-    n = 36
-    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    R_base = (minutes / 60) * spd * 1000
+    Re = 6371000.0
+    radii = [R_base * 0.8, R_base * 1.2]
+    N = 36
+    angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
 
-    dests = []
-    dlats_all = []
-    dlons_all = []
-    for r in radii:
-        dlats = [np.degrees(r / re * np.cos(a)) for a in angles]
-        dlons = [np.degrees(r / re * np.sin(a) / np.cos(np.radians(lat))) for a in angles]
-        for i in range(n):
+    dests, dlats_all, dlons_all = [], [], []
+    for R in radii:
+        dlats = [np.degrees(R / Re * np.cos(a)) for a in angles]
+        dlons = [np.degrees(R / Re * np.sin(a) / np.cos(np.radians(lat))) for a in angles]
+        for i in range(N):
             dests.append((lon + dlons[i], lat + dlats[i]))
             dlats_all.append(dlats[i])
             dlons_all.append(dlons[i])
 
     coords_str = f"{lon},{lat};" + ";".join(f"{d[0]:.6f},{d[1]:.6f}" for d in dests)
     dest_indices = ";".join(str(i + 1) for i in range(len(dests)))
-    url = f"http://router.project-osrm.org/table/v1/{profile}/{coords_str}?sources=0&destinations={dest_indices}&annotations=duration"
+    url = (f"http://router.project-osrm.org/table/v1/{profile}/{coords_str}"
+           f"?sources=0&destinations={dest_indices}&annotations=duration")
 
     resp = requests.get(url, timeout=35)
     resp.raise_for_status()
     data = resp.json()
     if data.get("code") != "Ok":
-        raise Exception(f"OSRM erreur : {data.get('message', data.get('code', 'inconnu'))}")
+        raise Exception(f"OSRM erreur : {data.get('message', 'inconnu')}")
 
     durations = data["durations"][0]
     target_sec = minutes * 60
@@ -411,6 +434,7 @@ def isochrone_osrm(lon: float, lat: float, minutes: int, profile: str):
 
     if len(pts) < 3:
         return Point(lon, lat).buffer(0.005)
+
     coords = np.array([(p.x, p.y) for p in pts])
     try:
         poly = alphashape.alphashape(coords, 0.25)
@@ -422,6 +446,9 @@ def isochrone_osrm(lon: float, lat: float, minutes: int, profile: str):
     return clean_geometry(unary_union(pts).convex_hull)
 
 
+# ─────────────────────────────────────────────────────────────────
+# ISOCHRONES — Moteur 5 : Valhalla
+# ─────────────────────────────────────────────────────────────────
 def isochrone_valhalla(lon: float, lat: float, minutes: int, costing: str):
     url = "https://valhalla1.openstreetmap.de/isochrone"
     body = {
@@ -439,19 +466,17 @@ def isochrone_valhalla(lon: float, lat: float, minutes: int, costing: str):
     raise Exception(f"Valhalla : réponse vide — {data.get('error', 'inconnu')}")
 
 
+# ─────────────────────────────────────────────────────────────────
+# ISOCHRONES — Moteur 6 : GraphHopper
+# ─────────────────────────────────────────────────────────────────
 def isochrone_graphhopper(lon: float, lat: float, minutes: int, profile: str, key: str = ""):
     url = "https://graphhopper.com/api/1/isochrone"
-    params = {
-        "point": f"{lat},{lon}",
-        "time_limit": minutes * 60,
-        "vehicle": profile,
-        "buckets": 1,
-        "type": "json",
-        "key": key.strip() if key else "",
-    }
+    params = {"point": f"{lat},{lon}", "time_limit": minutes * 60, "vehicle": profile, "buckets": 1, "type": "json"}
+    if key and key.strip():
+        params["key"] = key.strip()
     resp = requests.get(url, params=params, timeout=25)
     if resp.status_code == 401:
-        raise Exception("GraphHopper requiert une clé API.")
+        raise Exception("GraphHopper requiert une clé API. graphhopper.com/dashboard")
     if resp.status_code != 200:
         raise Exception(f"GraphHopper {resp.status_code}: {resp.text[:300]}")
     data = resp.json()
@@ -461,98 +486,9 @@ def isochrone_graphhopper(lon: float, lat: float, minutes: int, profile: str, ke
     raise Exception("GraphHopper : aucun polygone retourné")
 
 
-def route_ors(start_lon, start_lat, end_lon, end_lat, profile, key):
-    if not key or not key.strip():
-        raise Exception("Clé API ORS manquante.")
-    url = f"https://api.openrouteservice.org/v2/directions/{profile}/geojson"
-    body = {"coordinates": [[start_lon, start_lat], [end_lon, end_lat]]}
-    resp = requests.post(url, json=body, headers={"Authorization": key, "Content-Type": "application/json"}, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    feat = data["features"][0]
-    geom = shape(feat["geometry"])
-    summary = feat["properties"].get("summary", {})
-    return _route_summary(geom, summary.get("distance"), summary.get("duration"), "ORS")
-
-
-def route_osrm(start_lon, start_lat, end_lon, end_lat, profile):
-    url = f"https://router.project-osrm.org/route/v1/{profile}/{start_lon},{start_lat};{end_lon},{end_lat}?overview=full&geometries=geojson&steps=true"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    routes = data.get("routes", [])
-    if not routes:
-        raise Exception("OSRM : aucun itinéraire")
-    route = routes[0]
-    geom = shape(route["geometry"])
-    return _route_summary(geom, route.get("distance"), route.get("duration"), "OSRM")
-
-
-def route_graphhopper(start_lon, start_lat, end_lon, end_lat, profile, key):
-    if not key or not key.strip():
-        raise Exception("Clé GraphHopper manquante.")
-    url = "https://graphhopper.com/api/1/route"
-    params = {
-        "point": [f"{start_lat},{start_lon}", f"{end_lat},{end_lon}"],
-        "profile": profile,
-        "points_encoded": False,
-        "instructions": True,
-        "key": key.strip(),
-    }
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    paths = data.get("paths", [])
-    if not paths:
-        raise Exception("GraphHopper : aucun itinéraire")
-    path = paths[0]
-    geom = shape(path["points"])
-    return _route_summary(geom, path.get("distance"), path.get("time", 0) / 1000, "GraphHopper")
-
-
-def route_osmnx(start_lon, start_lat, end_lon, end_lat, mode="drive", gdf_roads=None):
-    dist = max(3000, int(np.sqrt((end_lon - start_lon) ** 2 + (end_lat - start_lat) ** 2) * 111000 * 2.2))
-    dist = min(dist, 120000)
-    G = ox.graph_from_point(((start_lat + end_lat) / 2, (start_lon + end_lon) / 2), dist=dist, network_type=mode, simplify=True)
-
-    default_speeds = {"walk": 4.5, "bike": 15.0, "drive": 40.0}
-    base_speed = default_speeds.get(mode, 40.0)
-
-    for _, _, d in G.edges(data=True):
-        ms = d.get("maxspeed")
-        edge_speed = base_speed
-        if isinstance(ms, list):
-            ms = ms[0]
-        if ms:
-            try:
-                edge_speed = float(str(ms).split()[0])
-            except Exception:
-                pass
-        length = d.get("length", 1)
-        d["travel_time"] = length / (max(edge_speed, 1) * 1000 / 3600)
-
-    start_node = ox.nearest_nodes(G, start_lon, start_lat)
-    end_node = ox.nearest_nodes(G, end_lon, end_lat)
-    route = nx.shortest_path(G, start_node, end_node, weight="travel_time")
-    coords = [(G.nodes[n]["x"], G.nodes[n]["y"]) for n in route]
-    line = LineString(coords)
-
-    distance_m = 0.0
-    duration_s = 0.0
-    for u, v in zip(route[:-1], route[1:]):
-        edge_data = G.get_edge_data(u, v)
-        if isinstance(edge_data, dict):
-            first_key = next(iter(edge_data)) if 0 in edge_data or len(edge_data) else None
-            if first_key is not None and isinstance(edge_data.get(first_key), dict):
-                edge = edge_data[first_key]
-            else:
-                edge = edge_data
-            distance_m += edge.get("length", 0)
-            duration_s += edge.get("travel_time", 0)
-
-    return _route_summary(line, distance_m, duration_s, "OSMnx")
-
-
+# ─────────────────────────────────────────────────────────────────
+# ISOCHRONES — Dispatcher central
+# ─────────────────────────────────────────────────────────────────
 def compute_isochrone(engine: str, lon: float, lat: float, minutes: int,
                       mode_api: str, mode_osm: str,
                       iso_method: str, alpha: float,
@@ -580,112 +516,286 @@ def compute_isochrone(engine: str, lon: float, lat: float, minutes: int,
         raise ValueError(f"Moteur inconnu: {engine}")
 
 
-def compute_route(engine: str, start_lon: float, start_lat: float,
-                  end_lon: float, end_lat: float,
+# ─────────────────────────────────────────────────────────────────
+# ITINÉRAIRES — ORS
+# ─────────────────────────────────────────────────────────────────
+def route_ors(lon_o: float, lat_o: float, lon_d: float, lat_d: float,
+              profile: str, key: str) -> dict:
+    if not key or not key.strip():
+        raise Exception("Clé API ORS manquante.")
+    url = f"https://api.openrouteservice.org/v2/directions/{profile}/geojson"
+    resp = requests.post(url,
+        json={"coordinates": [[lon_o, lat_o], [lon_d, lat_d]], "instructions": True,
+              "language": "fr", "units": "km"},
+        headers={"Authorization": key, "Content-Type": "application/json"}, timeout=25)
+    if resp.status_code != 200:
+        raise Exception(f"ORS route {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    feature = data["features"][0]
+    props = feature["properties"]
+    summary = props["summary"]
+    coords = [(c[0], c[1]) for c in feature["geometry"]["coordinates"]]
+    steps = []
+    for seg in props.get("segments", []):
+        for s in seg.get("steps", []):
+            steps.append({
+                "instruction": s.get("instruction", ""),
+                "distance_km": round(s.get("distance", 0), 2),
+                "duration_min": round(s.get("duration", 0) / 60, 1),
+            })
+    return {
+        "engine": "ORS",
+        "distance_km": round(summary["distance"], 2),
+        "duration_min": round(summary["duration"] / 60, 1),
+        "geometry": LineString(coords) if len(coords) >= 2 else None,
+        "steps": steps,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# ITINÉRAIRES — OSRM
+# ─────────────────────────────────────────────────────────────────
+def route_osrm(lon_o: float, lat_o: float, lon_d: float, lat_d: float,
+               profile: str) -> dict:
+    url = (f"http://router.project-osrm.org/route/v1/{profile}/"
+           f"{lon_o},{lat_o};{lon_d},{lat_d}"
+           f"?overview=full&geometries=geojson&steps=true")
+    resp = requests.get(url, timeout=25)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != "Ok":
+        raise Exception(f"OSRM route : {data.get('message', 'inconnu')}")
+    route = data["routes"][0]
+    coords = [(c[0], c[1]) for c in route["geometry"]["coordinates"]]
+    steps = []
+    for leg in route.get("legs", []):
+        for s in leg.get("steps", []):
+            maneuver = s.get("maneuver", {})
+            steps.append({
+                "instruction": f"{maneuver.get('type', '')} {maneuver.get('modifier', '')}".strip(),
+                "distance_km": round(s.get("distance", 0) / 1000, 2),
+                "duration_min": round(s.get("duration", 0) / 60, 1),
+                "name": s.get("name", ""),
+            })
+    return {
+        "engine": "OSRM",
+        "distance_km": round(route["distance"] / 1000, 2),
+        "duration_min": round(route["duration"] / 60, 1),
+        "geometry": LineString(coords) if len(coords) >= 2 else None,
+        "steps": steps,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# ITINÉRAIRES — Valhalla
+# ─────────────────────────────────────────────────────────────────
+def route_valhalla(lon_o: float, lat_o: float, lon_d: float, lat_d: float,
+                   costing: str) -> dict:
+    url = "https://valhalla1.openstreetmap.de/route"
+    body = {
+        "locations": [{"lon": lon_o, "lat": lat_o}, {"lon": lon_d, "lat": lat_d}],
+        "costing": costing,
+        "directions_options": {"language": "fr-FR", "units": "kilometers"},
+    }
+    resp = requests.post(url, json=body, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    trip = data.get("trip", {})
+    summary = trip.get("summary", {})
+    legs = trip.get("legs", [])
+    steps = []
+    coords = []
+    for leg in legs:
+        try:
+            import polyline as pl
+            shape_pts = pl.decode(leg.get("shape", ""), precision=6)
+            coords += [(pt[1], pt[0]) for pt in shape_pts]
+        except Exception:
+            pass
+        for m in leg.get("maneuvers", []):
+            steps.append({
+                "instruction": m.get("instruction", ""),
+                "distance_km": round(m.get("length", 0), 2),
+                "duration_min": round(m.get("time", 0) / 60, 1),
+            })
+    return {
+        "engine": "Valhalla",
+        "distance_km": round(summary.get("length", 0), 2),
+        "duration_min": round(summary.get("time", 0) / 60, 1),
+        "geometry": LineString(coords) if len(coords) >= 2 else None,
+        "steps": steps,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# ITINÉRAIRES — GraphHopper
+# ─────────────────────────────────────────────────────────────────
+def route_graphhopper(lon_o: float, lat_o: float, lon_d: float, lat_d: float,
+                      profile: str, key: str = "") -> dict:
+    url = "https://graphhopper.com/api/1/route"
+    params = {
+        "point": [f"{lat_o},{lon_o}", f"{lat_d},{lon_d}"],
+        "vehicle": profile,
+        "locale": "fr",
+        "calc_points": True,
+        "points_encoded": False,
+        "instructions": True,
+    }
+    if key and key.strip():
+        params["key"] = key.strip()
+    resp = requests.get(url, params=params, timeout=25)
+    if resp.status_code == 401:
+        raise Exception("GraphHopper requiert une clé API.")
+    if resp.status_code != 200:
+        raise Exception(f"GraphHopper route {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    path = data["paths"][0]
+    coords = [(c[0], c[1]) for c in path["points"]["coordinates"]]
+    steps = []
+    for inst in path.get("instructions", []):
+        steps.append({
+            "instruction": inst.get("text", ""),
+            "distance_km": round(inst.get("distance", 0) / 1000, 2),
+            "duration_min": round(inst.get("time", 0) / 60000, 1),
+        })
+    return {
+        "engine": "GraphHopper",
+        "distance_km": round(path["distance"] / 1000, 2),
+        "duration_min": round(path["time"] / 60000, 1),
+        "geometry": LineString(coords) if len(coords) >= 2 else None,
+        "steps": steps,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# ITINÉRAIRES — OSMnx local
+# ─────────────────────────────────────────────────────────────────
+def route_osmnx(lon_o: float, lat_o: float, lon_d: float, lat_d: float,
+                mode: str) -> dict:
+    mid_lon = (lon_o + lon_d) / 2
+    mid_lat = (lat_o + lat_d) / 2
+    dist_deg = math.sqrt((lon_d - lon_o)**2 + (lat_d - lat_o)**2)
+    dist_m = max(dist_deg * 111000 * 2.5, 2000)
+
+    G = ox.graph_from_point((mid_lat, mid_lon), dist=int(dist_m), network_type=mode, simplify=True)
+    orig = ox.nearest_nodes(G, lon_o, lat_o)
+    dest = ox.nearest_nodes(G, lon_d, lat_d)
+    G = ox.add_edge_speeds(G)
+    G = ox.add_edge_travel_times(G)
+
+    route_nodes = ox.shortest_path(G, orig, dest, weight="travel_time")
+    if route_nodes is None:
+        raise Exception("OSMnx : aucun chemin trouvé entre les deux points.")
+
+    coords = [(G.nodes[n]["x"], G.nodes[n]["y"]) for n in route_nodes]
+    total_dist = 0.0
+    total_time = 0.0
+    for u, v in zip(route_nodes[:-1], route_nodes[1:]):
+        edge_data = list(G.get_edge_data(u, v).values())[0]
+        total_dist += edge_data.get("length", 0)
+        total_time += edge_data.get("travel_time", 0)
+
+    return {
+        "engine": "OSMnx",
+        "distance_km": round(total_dist / 1000, 2),
+        "duration_min": round(total_time / 60, 1),
+        "geometry": LineString(coords) if len(coords) >= 2 else None,
+        "steps": [],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# ITINÉRAIRES — Dispatcher central
+# ─────────────────────────────────────────────────────────────────
+def compute_route(engine: str, lon_o: float, lat_o: float,
+                  lon_d: float, lat_d: float,
                   mode_api: str, mode_osm: str,
-                  ors_key: str = "", gh_key: str = "", gdf_roads=None):
-    if "ORS" in engine:
-        return route_ors(start_lon, start_lat, end_lon, end_lat, mode_api, ors_key)
+                  ors_key: str = "", gh_key: str = "") -> dict:
+    if "OSM local" in engine or "OSMnx" in engine:
+        return route_osmnx(lon_o, lat_o, lon_d, lat_d, mode_osm)
+    elif "ORS" in engine:
+        return route_ors(lon_o, lat_o, lon_d, lat_d, mode_api, ors_key)
     elif "OSRM" in engine:
-        return route_osrm(start_lon, start_lat, end_lon, end_lat, mode_api)
-    elif "GraphHopper" in engine:
-        return route_graphhopper(start_lon, start_lat, end_lon, end_lat, mode_api, gh_key)
-    elif "OSM local" in engine or "OSM Pur" in engine:
-        return route_osmnx(start_lon, start_lat, end_lon, end_lat, mode_osm, gdf_roads)
+        return route_osrm(lon_o, lat_o, lon_d, lat_d, mode_api)
     elif "Valhalla" in engine:
-        return route_osrm(start_lon, start_lat, end_lon, end_lat, "car" if mode_api in ["auto", "motorcycle"] else ("bike" if mode_api == "bicycle" else "foot"))
+        return route_valhalla(lon_o, lat_o, lon_d, lat_d, mode_api)
+    elif "GraphHopper" in engine:
+        return route_graphhopper(lon_o, lat_o, lon_d, lat_d, mode_api, gh_key)
     else:
         raise ValueError(f"Moteur inconnu: {engine}")
 
 
-def search_places_osm(query: str, limit: int = 10):
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": query, "format": "jsonv2", "limit": limit, "addressdetails": 1}
-    headers = {"User-Agent": "sante-isochrones-app/2.0"}
-    resp = requests.get(url, params=params, headers=headers, timeout=25)
-    resp.raise_for_status()
-    data = resp.json()
-    out = []
-    for i, row in enumerate(data):
-        out.append({
-            "id": i,
-            "name": row.get("display_name", query),
-            "lon": float(row["lon"]),
-            "lat": float(row["lat"]),
-            "class": row.get("class", ""),
-            "type": row.get("type", ""),
-        })
-    return out
-
-
+# ─────────────────────────────────────────────────────────────────
+# Métadonnées moteurs (pour l'UI)
+# ─────────────────────────────────────────────────────────────────
 def engines_metadata() -> dict:
     return {
         "OSM Pur (Tps_min local) — Recommandé": {
             "badge_class": "badge-local", "badge_label": "LOCAL ★",
-            "description": "Construit le graphe 100% depuis votre couche OSM (Tps_min, Vit_kmh). Aucun téléchargement. Plus fidèle à la réalité terrain.",
-            "needs_key": False, "needs_roads": True,
+            "description": "Graphe 100% depuis votre couche OSM (Tps_min, Vit_kmh). Aucun téléchargement.",
+            "needs_key": False, "needs_roads": True, "supports_route": False,
             "modes": {
                 "🚗 Véhicule": ("drive", "drive"),
-                "🚶 Marche": ("walk", "walk"),
-                "🚲 Vélo": ("bike", "bike"),
+                "🚶 Marche":   ("walk",  "walk"),
+                "🚲 Vélo":     ("bike",  "bike"),
             },
         },
         "OSM local (OSMnx + NetworkX) — Gratuit": {
             "badge_class": "badge-local", "badge_label": "LOCAL",
             "description": "Télécharge le réseau OSM + enrichit avec votre couche locale.",
-            "needs_key": False, "needs_roads": False,
+            "needs_key": False, "needs_roads": False, "supports_route": True,
             "modes": {
-                "🚶 Marche": ("walk", "walk"),
+                "🚶 Marche":   ("walk",  "walk"),
                 "🚗 Véhicule": ("drive", "drive"),
-                "🚲 Vélo": ("bike", "bike"),
+                "🚲 Vélo":     ("bike",  "bike"),
             },
         },
         "OpenRouteService (ORS) — Clé API": {
             "badge_class": "badge-api", "badge_label": "API",
-            "description": "Isochrones et itinéraires précis avec clé API.",
+            "description": "Très précis. Clé gratuite sur openrouteservice.org (500 req/jour).",
             "needs_key": True, "key_name": "ORS_API_KEY",
             "key_url": "https://openrouteservice.org/dev/#/signup",
-            "needs_roads": False,
+            "needs_roads": False, "supports_route": True,
             "modes": {
-                "🚶 Marche": ("foot-walking", "walk"),
-                "🚗 Voiture": ("driving-car", "drive"),
-                "🚲 Vélo": ("cycling-regular", "bike"),
-                "🛵 HGV": ("driving-hgv", "drive"),
+                "🚶 Marche":  ("foot-walking",   "walk"),
+                "🚗 Voiture": ("driving-car",    "drive"),
+                "🚲 Vélo":    ("cycling-regular", "bike"),
+                "🛵 HGV":     ("driving-hgv",    "drive"),
             },
         },
         "OSRM Public — Gratuit": {
             "badge_class": "badge-free", "badge_label": "GRATUIT",
-            "description": "Sans clé. Itinéraires et isochrones rapides.",
-            "needs_key": False, "needs_roads": False,
+            "description": "Sans clé. 72 points de sondage. Isochrones et itinéraires.",
+            "needs_key": False, "needs_roads": False, "supports_route": True,
             "modes": {
-                "🚗 Voiture": ("car", "drive"),
-                "🚲 Vélo": ("bike", "bike"),
-                "🚶 Marche": ("foot", "walk"),
+                "🚗 Voiture": ("car",  "drive"),
+                "🚲 Vélo":    ("bike", "bike"),
+                "🚶 Marche":  ("foot", "walk"),
             },
         },
         "Valhalla Public — Gratuit": {
             "badge_class": "badge-free", "badge_label": "GRATUIT",
-            "description": "Polygones précis, multi-modes, sans clé.",
-            "needs_key": False, "needs_roads": False,
+            "description": "valhalla.openstreetmap.de — polygones et itinéraires précis, 4 modes.",
+            "needs_key": False, "needs_roads": False, "supports_route": True,
             "modes": {
-                "🚶 Marche": ("pedestrian", "walk"),
-                "🚗 Voiture": ("auto", "drive"),
-                "🚲 Vélo": ("bicycle", "bike"),
-                "🛵 Moto": ("motorcycle", "drive"),
+                "🚶 Marche":  ("pedestrian", "walk"),
+                "🚗 Voiture": ("auto",       "drive"),
+                "🚲 Vélo":    ("bicycle",    "bike"),
+                "🛵 Moto":    ("motorcycle", "drive"),
             },
         },
-        "GraphHopper — Clé API": {
+        "GraphHopper — Clé API (gratuit 500 req/j)": {
             "badge_class": "badge-api", "badge_label": "API",
-            "description": "Itinéraires et polygones précis, clé requise.",
+            "description": "graphhopper.com — polygones et itinéraires précis. Clé requise.",
             "needs_key": True, "key_name": "GH_API_KEY",
             "key_url": "https://www.graphhopper.com/dashboard/",
-            "needs_roads": False,
+            "needs_roads": False, "supports_route": True,
             "modes": {
-                "🚗 Voiture": ("car", "drive"),
-                "🚶 Marche": ("foot", "walk"),
-                "🚲 Vélo": ("bike", "bike"),
-                "🛵 Moto": ("motorcycle", "drive"),
-                "🥾 Randonnée": ("hike", "walk"),
+                "🚗 Voiture":   ("car",        "drive"),
+                "🚶 Marche":    ("foot",        "walk"),
+                "🚲 Vélo":      ("bike",        "bike"),
+                "🛵 Moto":      ("motorcycle",  "drive"),
+                "🥾 Randonnée": ("hike",        "walk"),
             },
         },
     }
