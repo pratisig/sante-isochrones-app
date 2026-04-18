@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: isochrones-app
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: ORS_API_KEY
+        sync: false          # à saisir manuellement dans le dashboard Render
+      - key: GH_API_KEY
+        sync: false
+    healthCheckPath: /_stcore/health
+    autoDeploy: true
